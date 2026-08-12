@@ -276,11 +276,16 @@ def pa_decode_sparse(
     # the reduce masks their stale partial-buffer slots).
     # print(f"{kv_indices.shape[0]=}")
     if kv_splits is None:
-        max_kv_len = kv_indices.shape[0]
-        max_kv_splits = max(1, triton.cdiv(max_kv_len, block_k))
-        kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
-        kv_splits = min(max_kv_splits, kv_splits)
-        kv_splits = triton.next_power_of_2(kv_splits)
+        if use_gluon:
+            # On gfx1250 the extra split-K parallelism does not recover the
+            # reduction launch and partial-buffer traffic, even for T=1.
+            kv_splits = 1
+        else:
+            max_kv_len = kv_indices.shape[0]
+            max_kv_splits = max(1, triton.cdiv(max_kv_len, block_k))
+            kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
+            kv_splits = min(max_kv_splits, kv_splits)
+            kv_splits = triton.next_power_of_2(kv_splits)
 
     if use_gluon:
         _lds_budget = arch_info._LDS_CAP_BYTES.get(DEVICE_ARCH)
