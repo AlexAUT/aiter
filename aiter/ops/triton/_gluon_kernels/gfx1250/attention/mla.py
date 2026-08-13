@@ -483,6 +483,7 @@ class MLAProgram:
 
     q_lora: gl.tensor
     q_rope: gl.tensor
+    q_lora_shared: gl.shared_memory_descriptor
     kv_lora_shared: gl.shared_memory_descriptor
     k_rope_shared: gl.shared_memory_descriptor
     kv_lora_scales_shared: gl.shared_memory_descriptor
@@ -524,6 +525,7 @@ class MLAProgram:
         cfg,
         q_lora,
         q_rope,
+        q_lora_shared,
         kv_lora_shared,
         k_rope_shared,
         kv_lora_scales_shared,
@@ -559,6 +561,7 @@ class MLAProgram:
         self.cfg = cfg
         self.q_lora = q_lora
         self.q_rope = q_rope
+        self.q_lora_shared = q_lora_shared
         self.kv_buffer_ptr = kv_buffer_ptr
         self.output_ptr = output_ptr
         self.segm_max_ptr = segm_max_ptr
@@ -606,6 +609,7 @@ class MLAProgram:
         cfg: MLAConfig,
         q_lora,
         q_rope,
+        q_lora_shared,
         kv_buffer_ptr,
         output_ptr,
         segm_max_ptr,
@@ -764,6 +768,7 @@ class MLAProgram:
             cfg,
             q_lora,
             q_rope,
+            q_lora_shared,
             kv_lora_shared,
             k_rope_shared,
             kv_lora_scales_shared,
@@ -1068,20 +1073,23 @@ class MLAProgram:
 
     @gluon.jit
     def compute_qk_lora(self, k_lora, q_scales, k_scales, S):
+        q_lora = self.q_lora
+        if self.cfg.BLOCK_M == 128 and self.cfg.QUERY_DTYPE == "bf16":
+            q_lora = self.q_lora_shared.load(layout=self.cfg.Q_DOT_LAYOUT)
         if self.cfg.QUERY_DTYPE == "nvfp4":
             # A4W4
             return gl.amd.gfx1250.wmma_scaled(
-                self.q_lora, q_scales, "e2m1", k_lora, k_scales, "e2m1", S
+                q_lora, q_scales, "e2m1", k_lora, k_scales, "e2m1", S
             )
         elif self.cfg.KV_CACHE_DTYPE == "nvfp4":
             # A8W4
             return gl.amd.gfx1250.wmma_scaled(
-                self.q_lora, q_scales, "e4m3", k_lora, k_scales, "e2m1", S
+                q_lora, q_scales, "e4m3", k_lora, k_scales, "e2m1", S
             )
         else:
             # A16W16 / A16W8 / A8A8
-            k_lora = k_lora.to(self.q_lora.dtype)
-            return gl.amd.gfx1250.wmma(self.q_lora, k_lora, S)
+            k_lora = k_lora.to(q_lora.dtype)
+            return gl.amd.gfx1250.wmma(q_lora, k_lora, S)
 
     @gluon.jit
     def compute_qk_rope(self, k_rope, q_scales, k_scales, S):
@@ -1827,6 +1835,7 @@ def _mla_decode_fwd_kernel(
         cfg,
         Q_lora,
         Q_rope,
+        q_lora_shared,
         kv_buffer_ptr,
         segm_output_ptr,
         segm_max_ptr,
