@@ -315,8 +315,8 @@ def _moe_gemm_a16w4(
         shape=[128, 256],
     )
     COMPACT_SCALE_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [64, 0]],
-        lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 0]],
+        reg_bases=[[0, 1], [0, 2], [0, 8], [64, 0]],
+        lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 4]],
         warp_bases=[[16, 0], [32, 0]],
         block_bases=[],
         shape=[128, 16],
