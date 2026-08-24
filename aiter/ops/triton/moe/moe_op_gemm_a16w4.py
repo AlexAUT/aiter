@@ -218,7 +218,6 @@ def get_kernel_config_gluon_v1_swizzle(m, n, k, routing_data):
         block_n = 128
         num_warps = 4
         tile_per_warp = [1,2]
-        matrix_instr_nonkdim = 16
 
         grid_m = routing_data.n_blocks(m, block_m)
         grid_n = triton.cdiv(n, block_n)
