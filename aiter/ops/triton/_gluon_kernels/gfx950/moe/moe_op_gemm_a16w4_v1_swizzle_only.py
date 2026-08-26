@@ -335,7 +335,7 @@ def _moe_gemm_a16w4(
 
         w_scales = w_scales.trans(1, 0)
         w_scale_layout: gl.constexpr = gl.amd.get_scaled_upcast_fp4_scale_layout(
-            w, w_scales, gl.bfloat16, axis=0
+            w, MX_SCALE_BLOCK_K, gl.bfloat16, axis=0
         )
         w_scales = gl.convert_layout(w_scales, w_scale_layout)
 
