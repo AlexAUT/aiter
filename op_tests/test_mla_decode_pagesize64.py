@@ -25,6 +25,7 @@ import aiter
 import aiter.mla
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.triton.attention.mla import mla_decode_fwd as gluon_mla_decode_fwd
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -310,6 +311,14 @@ def _make_mla_mi400_q_case(
     )
 
 
+def _make_gluon_block_tables(kv_indices, batch, num_pages_per_batch):
+    device = kv_indices.device
+    block_tables = kv_indices[: batch * num_pages_per_batch].view(
+        batch, num_pages_per_batch
+    )
+    return block_tables.to(device=device, dtype=torch.int32)
+
+
 def _apply_causal_mask_(logits):
     # Matches the causal/tail mask shape used by the reference attention.
     _, s_q, s_k = logits.shape
@@ -393,6 +402,7 @@ def test_mla(
     dtype,
     kv_dtype,
     init,
+    backend,
 ):
     page_size = 64
     kv_lora_rank = 512
@@ -457,27 +467,60 @@ def test_mla(
         page_indices_oob=page_indices_oob,
     )
 
-    def run_mla_decode(out_tensor):
-        return aiter.mla.mla_decode_fwd(
-            q_mi400,
-            kv_buffer_mi400,
-            out_tensor,
-            qo_indptr,
-            case["kv_indptr"],
-            kv_indices_mi400,
-            case["kv_last_page_lens"],
-            decode_qlen,
-            case["page_size"],
-            nhead_kv,
-            1.0 / (qk_head_dim**0.5),
-            num_kv_splits=case["num_kv_splits"],
-            num_kv_splits_indptr=case["num_kv_splits_indptr"],
-            q_scale=case["q_scale"],
-            kv_scale=case["kv_scale"],
-            return_lse=True,
-        )
-
+    sm_scale = 1.0 / (qk_head_dim**0.5)
     out = torch.zeros((batch * decode_qlen, nhead, v_head_dim), dtype=torch.bfloat16)
+
+    if backend == "asm":
+        def run_mla_decode(out_tensor):
+            return aiter.mla.mla_decode_fwd(
+                q_mi400,
+                kv_buffer_mi400,
+                out_tensor,
+                qo_indptr,
+                case["kv_indptr"],
+                kv_indices_mi400,
+                case["kv_last_page_lens"],
+                decode_qlen,
+                case["page_size"],
+                nhead_kv,
+                sm_scale,
+                num_kv_splits=case["num_kv_splits"],
+                num_kv_splits_indptr=case["num_kv_splits_indptr"],
+                q_scale=case["q_scale"],
+                kv_scale=case["kv_scale"],
+                return_lse=True,
+            )
+    elif backend == "gluon":
+        num_pages_per_batch = case["num_pages_per_batch"]
+        block_tables = _make_gluon_block_tables(
+            kv_indices_mi400, batch, num_pages_per_batch
+        )
+        seq_lens_kv = torch.full((batch,), ctx_len, dtype=torch.int32, device="cuda")
+        max_seqlen_kv = int(seq_lens_kv.max().item())
+        q_gluon = q_fp8_mi400.contiguous()
+        kv_gluon = kv_buffer_mi400.contiguous()
+
+        def run_mla_decode(out_tensor):
+            gluon_mla_decode_fwd(
+                q_gluon,
+                kv_gluon,
+                out_tensor,
+                cu_seqlens_q=qo_indptr.to(dtype=torch.int32),
+                seqused_k=seq_lens_kv,
+                max_seqlen_kv=max_seqlen_kv,
+                block_tables=block_tables,
+                softmax_scale=sm_scale,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                causal=bool(mask),
+                q_descale=case["q_scale"],
+                kv_descale=case["kv_scale"],
+                shuffled_kv_cache=False,
+                kv_rope_split2=True,
+            )
+            return out_tensor
+    else:
+        raise ValueError(f"unsupported backend: {backend}")
 
     total_kv = batch * ctx_len
     flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
@@ -487,16 +530,20 @@ def test_mla(
         + total_q * nhead * v_head_dim * (torch.finfo(torch.bfloat16).bits // 8)
     )
 
-    attn, us = run_perftest(run_mla_decode, out)
-    attn_logits, attn_lse = attn
-    out_check = out.clone()
+    if backend == "asm":
+        attn, us = run_perftest(run_mla_decode, out)
+        attn_logits, attn_lse = attn
+        out_check = out.clone()
 
-    logits_shape = (batch * decode_qlen, case["num_kv_splits"], nhead, v_head_dim)
-    if case["num_kv_splits"] == 1:
-        logits_shape = (batch * decode_qlen, nhead, v_head_dim)
-    assert out_check.shape == (batch * decode_qlen, nhead, v_head_dim)
-    assert attn_logits.shape == logits_shape
-    assert attn_lse.shape == (batch * decode_qlen, nhead)
+        logits_shape = (batch * decode_qlen, case["num_kv_splits"], nhead, v_head_dim)
+        if case["num_kv_splits"] == 1:
+            logits_shape = (batch * decode_qlen, nhead, v_head_dim)
+        assert out_check.shape == (batch * decode_qlen, nhead, v_head_dim)
+        assert attn_logits.shape == logits_shape
+        assert attn_lse.shape == (batch * decode_qlen, nhead)
+    else:
+        _, us = run_perftest(run_mla_decode, out)
+        out_check = out.clone()
 
     final_out_finite = torch.isfinite(out_check.detach().float().cpu()).all().item()
     if final_out_finite:
@@ -528,7 +575,8 @@ def test_mla(
 
     ret = {
         "gfx": get_gfx(),
-        "num_kv_splits": case["num_kv_splits"],
+        "backend": backend,
+        "num_kv_splits": case["num_kv_splits"] if backend == "asm" else "n/a",
         "init": init,
         "mi400 us": us,
         "mi400 TFLOPS": flops / us / 1e6,
@@ -570,6 +618,7 @@ def _format_summary(rows):
         "nhead",
         "decode_qlen",
         "mask",
+        "backend",
         "num_kv_splits",
         "dtype",
         "kv_dtype",
@@ -669,7 +718,16 @@ def main():
         help="""Input initializer. const0.25 fills Q/KV/fallback pages with 0.25.
         e.g.: --init randn const0.25""",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["asm", "gluon"],
+        default="asm",
+        help="""Decode backend: asm (aiter.mla.mla_decode_fwd) or gluon
+        (aiter.ops.triton.attention.mla.mla_decode_fwd).""",
+    )
     args = parser.parse_args()
+
+    split_kv_values = args.split_kv if args.backend == "asm" else [None]
 
     rows = []
     for (
@@ -687,7 +745,7 @@ def main():
         args.kv_dtype,
         args.batch,
         args.ctxLen,
-        args.split_kv,
+        split_kv_values,
         args.mask,
         args.init,
     ):
@@ -710,6 +768,7 @@ def main():
                 dtype,
                 kv_dtype,
                 init,
+                args.backend,
             )
         )
 
@@ -718,9 +777,13 @@ def main():
         return
 
     df = _format_summary(rows)
+    try:
+        table = df.to_markdown(index=False)
+    except ImportError:
+        table = df.to_string(index=False)
     aiter.logger.info(
         "mla_decode_pagesize64 summary (markdown):\n%s",
-        df.to_markdown(index=False),
+        table,
     )
 
 

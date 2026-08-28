@@ -27,6 +27,9 @@ try:
         _mla_decode_fwd_reduce_kernel as gluon_mla_decode_fwd_reduce_kernel,
     )
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
+        _mla_decode_fwd_reduce_heads_kernel as gluon_mla_decode_fwd_reduce_heads_kernel,
+    )
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
         _mla_prefill_fwd_kernel_non_pipelined as gluon_mla_prefill_fwd_kernel_non_pipelined,
     )
 except:  # noqa: E722
@@ -34,6 +37,7 @@ except:  # noqa: E722
     gluon_mla_decode_fwd_kernel_non_pipelined = None
     gluon_mla_decode_fwd_kernel = None
     gluon_mla_decode_fwd_reduce_kernel = None
+    gluon_mla_decode_fwd_reduce_heads_kernel = None
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -41,6 +45,91 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
+
+
+def pack_kv_rope_split2(
+    kv_buffer: torch.Tensor, kv_lora_rank: int, qk_rope_head_dim: int
+) -> torch.Tensor:
+    """Pack page KV to ASM rope_split2 layout: [nope tokens flat | rope tokens flat] per page."""
+    pages, page_size, num_kv_heads, head_dim = kv_buffer.shape
+    assert head_dim == kv_lora_rank + qk_rope_head_dim
+    packed = torch.cat(
+        (
+            kv_buffer[..., :kv_lora_rank].reshape(pages, page_size * kv_lora_rank),
+            kv_buffer[..., kv_lora_rank:].reshape(pages, page_size * qk_rope_head_dim),
+        ),
+        dim=-1,
+    )
+    return packed.reshape(pages, page_size, num_kv_heads, head_dim).contiguous()
+
+
+def _decode_max_block_m(
+    q_dtype,
+    kv_buffer_dtype,
+    num_queries_per_kv,
+    num_seqs,
+    max_seqlen_kv,
+):
+    """Pick the widest head tile that avoids fp8 VGPR spill on gfx1250 decode."""
+    use_wide_bf16_tile = (
+        q_dtype == torch.bfloat16
+        and kv_buffer_dtype == torch.bfloat16
+        and (num_seqs >= 32 or max_seqlen_kv >= 32768)
+    )
+    if kv_buffer_dtype == e4m3_dtype:
+        if num_queries_per_kv >= 128 and num_seqs >= 128 and max_seqlen_kv <= 2048:
+            # 128-wide fp8 tile spills at large batch + short ctx; split heads.
+            return 64
+        return 128
+    if use_wide_bf16_tile:
+        return 128
+    return 64
+
+
+def select_ep_fp8_decode_config(
+    page_size,
+    max_seqlen_kv,
+    num_seqs,
+    num_query_heads,
+    num_tokens_per_seq,
+    q_dtype,
+    total_num_q_blocks,
+    num_kv_heads,
+):
+    """ASM-aligned EP decode: match ASM launch occupancy on Gluon's grid axes.
+
+    ASM qh128 grid is (1, batch, kv_split*2): two 64-head WGs per (batch, split).
+    Gluon uses (batch*NUM_HEAD_BLOCKS, 1, NUM_SEGMENTS). Derive NUM_SEGMENTS so
+    batch * NUM_HEAD_BLOCKS * NUM_SEGMENTS == batch * wg_per_split * kv_splits.
+    Inner KV WMMA tile stays page_size (64); ASM mgc=32 only governs split merge.
+    """
+    from aiter.mla import get_meta_param
+
+    total_kv = num_seqs * max_seqlen_kv
+    num_kv_splits, _ = get_meta_param(
+        None, num_seqs, total_kv, num_query_heads, num_tokens_per_seq, q_dtype
+    )
+    wg_per_split = 2  # qh128 gfx1250: gdz = kv_split * 2
+    asm_wgs = num_seqs * wg_per_split * num_kv_splits
+    gluon_qkv_blocks = max(1, total_num_q_blocks * num_kv_heads)
+    num_segments = max(1, asm_wgs // gluon_qkv_blocks)
+    num_segments = triton.next_power_of_2(num_segments)
+    max_segments = min(128, math.ceil(max_seqlen_kv / page_size))
+    num_segments = min(num_segments, max_segments)
+
+    return {
+        "TILE_SIZE": page_size,
+        "NUM_SEGMENTS_PER_SEQ": num_segments,
+        "num_warps": 4,
+        "waves_per_eu": 1,
+        "num_stages": 2,
+    }, {
+        "TILE_SIZE": page_size,
+        "NUM_SEGMENTS_PER_SEQ": num_segments,
+        "num_warps": 4,
+        "waves_per_eu": 1,
+        "num_stages": 1,
+    }
 
 
 def select_2d_config(
@@ -278,6 +367,10 @@ def mla_decode_fwd(
     q_scales=None,
     out_scale=None,
     shuffled_kv_cache: bool = False,
+    kv_rope_split2: bool | None = None,
+    ep_use_tdm: bool = False,
+    ep_asm_head_split: bool | None = None,
+    ep_tdm_cluster: bool | None = None,
     skip_reduce: bool = False,
 ):
     assert causal, "Only causal attention is supported"
@@ -340,15 +433,71 @@ def mla_decode_fwd(
         kv_lora_rank + qk_rope_head_dim == qk_head_dim
     ), "qk_head_dim must be equal to kv_lora_rank + qk_rope_head_dim"
 
-    MAX_BLOCK_M = 128 if kv_buffer_dtype == e4m3_dtype else 64
-    if num_queries_per_kv <= 16:
-        BLOCK_M = 16
+    # Production DSv3 EP decode: 128 Q heads, 1 KV head (MQA / GQA=128).
+    ep_fp8_decode = (
+        IS_DEVICE_ARCH_GFX12
+        and kv_buffer_dtype == e4m3_dtype
+        and num_queries_per_kv >= 128
+        and num_tokens_per_seq == 1
+    )
+    if ep_fp8_decode:
+        assert num_kv_heads == 1, (
+            f"EP fp8 decode expects num_kv_heads=1 (MQA), got {num_kv_heads} "
+            f"with {num_query_heads} query heads"
+        )
+
+    if kv_rope_split2 is None:
+        # Production EP KV matches ASM rope_split2 page packing.
+        kv_rope_split2 = ep_fp8_decode
+    if ep_tdm_cluster is None:
+        # At large production shapes, two 4-warp CTAs can multicast one TDM
+        # tile and outperform two independent 64-head CTAs. Smaller shapes are
+        # left on the lower-overhead head-split path.
+        ep_tdm_cluster = (
+            ep_fp8_decode
+            and ep_use_tdm
+            and num_seqs == 128
+            and max_seqlen_kv >= 4096
+        )
+    if ep_asm_head_split is None:
+        # TDM needs the lower-register 2x64 topology to offset its LDS reads.
+        # The synchronous default remains 128-wide.
+        ep_asm_head_split = ep_use_tdm
+    if ep_tdm_cluster:
+        assert ep_fp8_decode and ep_use_tdm and kv_rope_split2
+        ep_asm_head_split = False
+
+    if ep_fp8_decode:
+        MAX_BLOCK_M = _decode_max_block_m(
+            q_dtype,
+            kv_buffer_dtype,
+            num_queries_per_kv,
+            num_seqs,
+            max_seqlen_kv,
+        )
+        if ep_asm_head_split:
+            BLOCK_M = 64
+            NUM_HEAD_BLOCKS = num_queries_per_kv // BLOCK_M
+        else:
+            BLOCK_M = min(triton.next_power_of_2(num_queries_per_kv), MAX_BLOCK_M)
+            NUM_HEAD_BLOCKS = (num_queries_per_kv + BLOCK_M - 1) // BLOCK_M
+        BLOCK_Q = max(BLOCK_M // num_queries_per_kv, 1)
     else:
-        BLOCK_M = min(triton.next_power_of_2(num_queries_per_kv), MAX_BLOCK_M)
-    BLOCK_Q = BLOCK_M // num_queries_per_kv
-    assert BLOCK_Q >= 1 or (num_queries_per_kv > BLOCK_M)
-    BLOCK_Q = max(BLOCK_Q, 1)
-    NUM_HEAD_BLOCKS = (num_queries_per_kv + BLOCK_M - 1) // BLOCK_M
+        MAX_BLOCK_M = _decode_max_block_m(
+            q_dtype,
+            kv_buffer_dtype,
+            num_queries_per_kv,
+            num_seqs,
+            max_seqlen_kv,
+        )
+        if num_queries_per_kv <= 16:
+            BLOCK_M = 16
+        else:
+            BLOCK_M = min(triton.next_power_of_2(num_queries_per_kv), MAX_BLOCK_M)
+        BLOCK_Q = BLOCK_M // num_queries_per_kv
+        assert BLOCK_Q >= 1 or (num_queries_per_kv > BLOCK_M)
+        BLOCK_Q = max(BLOCK_Q, 1)
+        NUM_HEAD_BLOCKS = (num_queries_per_kv + BLOCK_M - 1) // BLOCK_M
     cu_count = get_num_sms()
     target_num_prgms = cu_count * 4
     ALL_DECODE = num_tokens_per_seq == 1
@@ -359,18 +508,33 @@ def mla_decode_fwd(
             ((num_tokens_per_seq + BLOCK_Q - 1) // BLOCK_Q) * num_seqs * NUM_HEAD_BLOCKS
         )
     num_2d_prgms = total_num_q_blocks * num_kv_heads
-    # if batch contains a prefill
 
-    attn_config, reduce_config = select_3d_config(
-        block_size,
-        max_seqlen_kv,
-        target_num_prgms,
-        num_2d_prgms,
-        q_dtype,
-        kv_buffer_dtype,
-        shuffled_kv_cache,
-        BLOCK_M,
-    )
+    if ep_fp8_decode:
+        attn_config, reduce_config = select_ep_fp8_decode_config(
+            block_size,
+            max_seqlen_kv,
+            num_seqs,
+            num_query_heads,
+            num_tokens_per_seq,
+            q_dtype,
+            total_num_q_blocks,
+            num_kv_heads,
+        )
+    else:
+        attn_config, reduce_config = select_3d_config(
+            block_size,
+            max_seqlen_kv,
+            target_num_prgms,
+            num_2d_prgms,
+            q_dtype,
+            kv_buffer_dtype,
+            shuffled_kv_cache,
+            BLOCK_M,
+        )
+
+    if ep_tdm_cluster:
+        attn_config = dict(attn_config)
+        attn_config["NUM_SEGMENTS_PER_SEQ"] = 1
 
     NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
     if NUM_SEGMENTS > 1:
@@ -379,7 +543,7 @@ def mla_decode_fwd(
             num_query_heads,
             NUM_SEGMENTS,
             triton.next_power_of_2(kv_lora_rank),
-            dtype=torch.float32,
+            dtype=torch.bfloat16 if ep_fp8_decode else torch.float32,
             device=q.device,
         )
         segm_max = torch.empty(
@@ -407,7 +571,7 @@ def mla_decode_fwd(
         else:
             impl = gluon_mla_decode_fwd_kernel_non_pipelined
 
-        impl[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
+        common_launch = dict(
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
             segm_expsum_ptr=segm_expsum,
@@ -452,6 +616,17 @@ def mla_decode_fwd(
             NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
             **attn_config,
         )
+        if shuffled_kv_cache:
+            impl[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](**common_launch)
+        else:
+            impl[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
+                PAGE_SIZE=block_size,
+                EP_USE_KV_CA=ep_fp8_decode,
+                EP_USE_TDM=ep_fp8_decode and ep_use_tdm and kv_rope_split2,
+                EP_ROPE_SPLIT2=kv_rope_split2,
+                num_ctas=2 if ep_tdm_cluster else 1,
+                **common_launch,
+            )
     else:
         triton_mla_decode_fwd_kernel[(total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
             segm_output_ptr=segm_output,
@@ -495,15 +670,30 @@ def mla_decode_fwd(
     elif skip_reduce:
         return segm_output, segm_max, segm_expsum
 
-    # Temporarily disable gluon reduce kernel, optimize later
-    # if IS_DEVICE_ARCH_GFX12:
-    #     _reduce_kernel = gluon_mla_decode_fwd_reduce_kernel
-    # else:
-    #     _reduce_kernel = triton_mla_decode_fwd_reduce_kernel
+    if (
+        ep_fp8_decode
+        and NUM_SEGMENTS == 2
+        and gluon_mla_decode_fwd_reduce_heads_kernel is not None
+    ):
+        _reduce_kernel = gluon_mla_decode_fwd_reduce_heads_kernel
+        reduce_config = {
+            **reduce_config,
+            "HEADS_PER_BLOCK": 8,
+            "num_warps": 8,
+            "waves_per_eu": 1,
+        }
+        reduce_grid = (
+            total_num_tokens,
+            triton.cdiv(num_query_heads, reduce_config["HEADS_PER_BLOCK"]),
+        )
+    elif IS_DEVICE_ARCH_GFX12 and gluon_mla_decode_fwd_reduce_kernel is not None:
+        _reduce_kernel = gluon_mla_decode_fwd_reduce_kernel
+        reduce_grid = (total_num_tokens, num_query_heads)
+    else:
+        _reduce_kernel = triton_mla_decode_fwd_reduce_kernel
+        reduce_grid = (total_num_tokens, num_query_heads)
 
-    _reduce_kernel = triton_mla_decode_fwd_reduce_kernel
-
-    _reduce_kernel[(total_num_tokens, num_query_heads)](
+    _reduce_kernel[reduce_grid](
         output_ptr=out,
         segm_output_ptr=segm_output,
         segm_max_ptr=segm_max,
