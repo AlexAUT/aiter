@@ -1945,7 +1945,7 @@ def _mla_decode_fwd_kernel(
         j_hbm_start: gl.int32 = segm_idx * tiles_per_segment
         num_tiles_this_seg: gl.int32 = pgm.tile_end - pgm.tile_start
         j_hbm: gl.int32 = 0
-        buffer_id: gl.int32 = 0
+        slot_iter: gl.int32 = 0
 
         j_hbm, physical_block_idx = pgm.load_physical_block_idx(
             j_hbm, block_tables_ptr_shifted, j_hbm_start
@@ -1977,7 +1977,8 @@ def _mla_decode_fwd_kernel(
                 j_hbm, block_tables_ptr_shifted, j_hbm_start, num_tiles_this_seg
             )
             for tile_idx in range(pgm.tile_start, pgm.tile_end - 3):
-                fill_buffer_id = (buffer_id + 3) % 4
+                read_buffer_id = slot_iter % 4
+                fill_buffer_id = (slot_iter + 3) % 4
                 row_offsets = pgm.get_kv_buffer_row_offsets(future_physical_block_idx)
                 pgm.tdm_load_global_to_shared_kv_lora(row_offsets, fill_buffer_id)
                 pgm.tdm_load_global_to_shared_k_rope(row_offsets, fill_buffer_id)
@@ -1985,7 +1986,7 @@ def _mla_decode_fwd_kernel(
                     L,
                     M,
                     acc,
-                    buffer_id,
+                    read_buffer_id,
                     tile_idx,
                     qk_factor,
                     wait_lora=7,
@@ -2001,37 +2002,40 @@ def _mla_decode_fwd_kernel(
                         num_tiles_this_seg,
                     )
                 )
-                buffer_id = (buffer_id + 1) % 4
+                slot_iter = slot_iter + 1
 
+            read_buffer_id = slot_iter % 4
             L, M, acc = pgm.process_tile_fp8(
                 L,
                 M,
                 acc,
-                buffer_id,
+                read_buffer_id,
                 pgm.tile_end - 3,
                 qk_factor,
                 wait_lora=5,
                 wait_rope=4,
                 IS_LAST=False,
             )
-            buffer_id = (buffer_id + 1) % 4
+            slot_iter = slot_iter + 1
+            read_buffer_id = slot_iter % 4
             L, M, acc = pgm.process_tile_fp8(
                 L,
                 M,
                 acc,
-                buffer_id,
+                read_buffer_id,
                 pgm.tile_end - 2,
                 qk_factor,
                 wait_lora=3,
                 wait_rope=2,
                 IS_LAST=False,
             )
-            buffer_id = (buffer_id + 1) % 4
+            slot_iter = slot_iter + 1
+            read_buffer_id = slot_iter % 4
             L, M, acc = pgm.process_tile_fp8(
                 L,
                 M,
                 acc,
-                buffer_id,
+                read_buffer_id,
                 pgm.tile_end - 1,
                 qk_factor,
                 wait_lora=1,
