@@ -19,11 +19,25 @@ float8_info = torch.finfo(e4m3_dtype)
 
 
 @gluon.jit
+def prefetch_kv_lora_chunk0(
+    pgm: MLAProgram,
+    wait_lora: gl.constexpr,
+    buffer_id,
+):
+    chunk_k: gl.constexpr = 128
+    gl.amd.gfx1250.tdm.async_wait(wait_lora)
+    return pgm.lds_unshuffle_kv_lora(buffer_id).slice(
+        0, chunk_k, dim=0
+    ).load(layout=pgm.cfg.K_DOT_LAYOUT)
+
+
+@gluon.jit
 def compute_qk_tile_fp8(
     pgm: MLAProgram,
     buffer_id,
     tile_idx,
     qk_factor,
+    kv_lora_chunk0_prefetched,
     wait_lora: gl.constexpr,
     wait_rope: gl.constexpr,
     IS_LAST: gl.constexpr,
@@ -37,10 +51,7 @@ def compute_qk_tile_fp8(
     tl.static_assert(pgm.cfg.KV_LORA_RANK == (4 * chunk_k))
 
     q_lora_chunk0 = gl.amd.slice(pgm.q_lora, [pgm.cfg.BLOCK_M, chunk_k], [0, 0])
-    gl.amd.gfx1250.tdm.async_wait(wait_lora)
-    kv_lora_chunk0 = pgm.lds_unshuffle_kv_lora(buffer_id).slice(
-        0, chunk_k, dim=0
-    ).load(layout=pgm.cfg.K_DOT_LAYOUT)
+    kv_lora_chunk0 = kv_lora_chunk0_prefetched
     kv_lora_chunk0 = kv_lora_chunk0.to(q_lora_chunk0.dtype)
 
     q_lora_chunk1 = gl.amd.slice(pgm.q_lora, [pgm.cfg.BLOCK_M, chunk_k], [0, 128])
@@ -102,6 +113,7 @@ def process_tile_fp8(
     buffer_id,
     tile_idx,
     qk_factor,
+    kv_lora_chunk0_prefetched,
     wait_lora: gl.constexpr,
     wait_rope: gl.constexpr,
     IS_LAST: gl.constexpr,
@@ -111,6 +123,7 @@ def process_tile_fp8(
         buffer_id,
         tile_idx,
         qk_factor,
+        kv_lora_chunk0_prefetched,
         wait_lora,
         wait_rope,
         IS_LAST,
@@ -431,12 +444,22 @@ def _mla_decode_fwd_kernel_prefetch(
         j_hbm, future_physical_block_idx = pgm.load_physical_block_idx_with_mod(
             j_hbm, block_tables_ptr_shifted, j_hbm_start, num_tiles_this_seg
         )
+        read_buffer_id = slot_iter % 4
+        prefetched_chunk0 = prefetch_kv_lora_chunk0(
+            pgm, wait_lora=7, buffer_id=read_buffer_id
+        )
         for tile_idx in range(pgm.tile_start, pgm.tile_end - 3):
             read_buffer_id = slot_iter % 4
+            next_read_buffer_id = (slot_iter + 1) % 4
             fill_buffer_id = (slot_iter + 3) % 4
             row_offsets = pgm.get_kv_buffer_row_offsets(future_physical_block_idx)
             pgm.tdm_load_global_to_shared_kv_lora(row_offsets, fill_buffer_id)
             pgm.tdm_load_global_to_shared_k_rope(row_offsets, fill_buffer_id)
+            next_prefetched_chunk0 = prefetch_kv_lora_chunk0(
+                pgm,
+                wait_lora=7,
+                buffer_id=next_read_buffer_id,
+            )
             L, M, acc = process_tile_fp8(
                 pgm,
                 L,
@@ -445,6 +468,7 @@ def _mla_decode_fwd_kernel_prefetch(
                 read_buffer_id,
                 tile_idx,
                 qk_factor,
+                prefetched_chunk0,
                 wait_lora=7,
                 wait_rope=6,
                 IS_LAST=False,
@@ -457,6 +481,7 @@ def _mla_decode_fwd_kernel_prefetch(
                 num_tiles_this_seg,
             )
             slot_iter = slot_iter + 1
+            prefetched_chunk0 = next_prefetched_chunk0
 
         read_buffer_id = slot_iter % 4
         L, M, acc = process_tile_fp8(
@@ -467,12 +492,16 @@ def _mla_decode_fwd_kernel_prefetch(
             read_buffer_id,
             pgm.tile_end - 3,
             qk_factor,
+            prefetched_chunk0,
             wait_lora=5,
             wait_rope=4,
             IS_LAST=False,
         )
         slot_iter = slot_iter + 1
         read_buffer_id = slot_iter % 4
+        prefetched_chunk0 = prefetch_kv_lora_chunk0(
+            pgm, wait_lora=3, buffer_id=read_buffer_id
+        )
         L, M, acc = process_tile_fp8(
             pgm,
             L,
@@ -481,12 +510,16 @@ def _mla_decode_fwd_kernel_prefetch(
             read_buffer_id,
             pgm.tile_end - 2,
             qk_factor,
+            prefetched_chunk0,
             wait_lora=3,
             wait_rope=2,
             IS_LAST=False,
         )
         slot_iter = slot_iter + 1
         read_buffer_id = slot_iter % 4
+        prefetched_chunk0 = prefetch_kv_lora_chunk0(
+            pgm, wait_lora=1, buffer_id=read_buffer_id
+        )
         L, M, acc = process_tile_fp8(
             pgm,
             L,
@@ -495,6 +528,7 @@ def _mla_decode_fwd_kernel_prefetch(
             read_buffer_id,
             pgm.tile_end - 1,
             qk_factor,
+            prefetched_chunk0,
             wait_lora=1,
             wait_rope=0,
             IS_LAST=True,
@@ -506,6 +540,7 @@ def _mla_decode_fwd_kernel_prefetch(
         row_offsets = pgm.get_kv_buffer_row_offsets(next_physical_block_idx)
         pgm.tdm_load_global_to_shared_kv_lora(row_offsets, 1)
         pgm.tdm_load_global_to_shared_k_rope(row_offsets, 1)
+        prefetched_chunk0 = prefetch_kv_lora_chunk0(pgm, wait_lora=3, buffer_id=0)
         L, M, acc = process_tile_fp8(
             pgm,
             L,
@@ -514,10 +549,12 @@ def _mla_decode_fwd_kernel_prefetch(
             0,
             pgm.tile_end - 2,
             qk_factor,
+            prefetched_chunk0,
             wait_lora=3,
             wait_rope=2,
             IS_LAST=False,
         )
+        prefetched_chunk0 = prefetch_kv_lora_chunk0(pgm, wait_lora=1, buffer_id=1)
         L, M, acc = process_tile_fp8(
             pgm,
             L,
@@ -526,11 +563,13 @@ def _mla_decode_fwd_kernel_prefetch(
             1,
             pgm.tile_end - 1,
             qk_factor,
+            prefetched_chunk0,
             wait_lora=1,
             wait_rope=0,
             IS_LAST=True,
         )
     else:
+        prefetched_chunk0 = prefetch_kv_lora_chunk0(pgm, wait_lora=1, buffer_id=0)
         L, M, acc = process_tile_fp8(
             pgm,
             L,
@@ -539,6 +578,7 @@ def _mla_decode_fwd_kernel_prefetch(
             0,
             pgm.tile_end - 1,
             qk_factor,
+            prefetched_chunk0,
             wait_lora=1,
             wait_rope=0,
             IS_LAST=True,
