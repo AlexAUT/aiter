@@ -42,7 +42,6 @@ def compute_qk_tile_fp8(
         0, chunk_k, dim=0
     ).load(layout=pgm.cfg.K_DOT_LAYOUT)
     kv_lora_chunk0 = kv_lora_chunk0.to(q_lora_chunk0.dtype)
-    S = gl.amd.gfx1250.wmma(q_lora_chunk0, kv_lora_chunk0, S)
 
     q_lora_chunk1 = gl.amd.slice(pgm.q_lora, [pgm.cfg.BLOCK_M, chunk_k], [0, 128])
     gl.amd.gfx1250.tdm.async_wait(wait_lora)
@@ -50,7 +49,7 @@ def compute_qk_tile_fp8(
         128, chunk_k, dim=0
     ).load(layout=pgm.cfg.K_DOT_LAYOUT)
     kv_lora_chunk1 = kv_lora_chunk1.to(q_lora_chunk1.dtype)
-    S = gl.amd.gfx1250.wmma(q_lora_chunk1, kv_lora_chunk1, S)
+    S = gl.amd.gfx1250.wmma(q_lora_chunk0, kv_lora_chunk0, S)
 
     q_lora_chunk2 = gl.amd.slice(pgm.q_lora, [pgm.cfg.BLOCK_M, chunk_k], [0, 256])
     gl.amd.gfx1250.tdm.async_wait(wait_lora)
@@ -58,7 +57,7 @@ def compute_qk_tile_fp8(
         256, chunk_k, dim=0
     ).load(layout=pgm.cfg.K_DOT_LAYOUT)
     kv_lora_chunk2 = kv_lora_chunk2.to(q_lora_chunk2.dtype)
-    S = gl.amd.gfx1250.wmma(q_lora_chunk2, kv_lora_chunk2, S)
+    S = gl.amd.gfx1250.wmma(q_lora_chunk1, kv_lora_chunk1, S)
 
     q_lora_chunk3 = gl.amd.slice(pgm.q_lora, [pgm.cfg.BLOCK_M, chunk_k], [0, 384])
     gl.amd.gfx1250.tdm.async_wait(wait_lora)
@@ -66,6 +65,7 @@ def compute_qk_tile_fp8(
         384, chunk_k, dim=0
     ).load(layout=pgm.cfg.K_DOT_LAYOUT)
     kv_lora_chunk3 = kv_lora_chunk3.to(q_lora_chunk3.dtype)
+    S = gl.amd.gfx1250.wmma(q_lora_chunk2, kv_lora_chunk2, S)
     S = gl.amd.gfx1250.wmma(q_lora_chunk3, kv_lora_chunk3, S)
 
     k_rope = pgm.tdm_shared_load_k_rope(wait_rope, buffer_id)
