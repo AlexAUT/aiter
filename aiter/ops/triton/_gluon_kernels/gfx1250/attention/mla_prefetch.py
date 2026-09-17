@@ -76,8 +76,9 @@ def compute_qk_tile_fp8(
         384, chunk_k, dim=0
     ).load(layout=pgm.cfg.K_DOT_LAYOUT)
     kv_lora_chunk3 = kv_lora_chunk3.to(q_lora_chunk3.dtype)
-    S = gl.amd.gfx1250.wmma(q_lora_chunk2, kv_lora_chunk2, S)
-    S = gl.amd.gfx1250.wmma(q_lora_chunk3, kv_lora_chunk3, S)
+    with gl.amd.warp_pipeline_stage("qk_wmma", priority=2):
+        S = gl.amd.gfx1250.wmma(q_lora_chunk2, kv_lora_chunk2, S)
+        S = gl.amd.gfx1250.wmma(q_lora_chunk3, kv_lora_chunk3, S)
 
     k_rope = pgm.tdm_shared_load_k_rope(wait_rope, buffer_id)
     S = pgm.compute_qk_rope(k_rope, None, None, S) * qk_factor
@@ -104,7 +105,8 @@ def finish_tile_fp8(
 ):
     p, alpha, M = pgm.softmax_part0(S, M)
     p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
-    acc = pgm.compute_pkv_lora_trans(p, kv_lora_trans_prefetched, None, acc)
+    with gl.amd.warp_pipeline_stage("pv_wmma", priority=1):
+        acc = pgm.compute_pkv_lora_trans(p, kv_lora_trans_prefetched, None, acc)
     return L, M, acc
 
 
@@ -125,6 +127,7 @@ def process_tile_fp8(
     kv_lora_trans_prefetched = pgm.lds_unshuffle_kv_lora_trans(buffer_id).load(
         layout=pgm.cfg.V_DOT_LAYOUT
     )
+
     S = compute_qk_tile_fp8(
         pgm,
         buffer_id,
@@ -135,6 +138,7 @@ def process_tile_fp8(
         wait_rope,
         IS_LAST,
     )
+
     return finish_tile_fp8(pgm, S, L, M, acc, kv_lora_trans_prefetched)
 
 
