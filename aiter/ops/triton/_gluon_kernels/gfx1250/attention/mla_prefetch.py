@@ -94,13 +94,17 @@ def compute_qk_tile_fp8(
 
 
 @gluon.jit
-def finish_tile_fp8(pgm: MLAProgram, S, L, M, acc, buffer_id):
+def finish_tile_fp8(
+    pgm: MLAProgram,
+    S,
+    L,
+    M,
+    acc,
+    kv_lora_trans_prefetched,
+):
     p, alpha, M = pgm.softmax_part0(S, M)
     p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
-    kv_lora_trans = pgm.lds_unshuffle_kv_lora_trans(buffer_id).load(
-        layout=pgm.cfg.V_DOT_LAYOUT
-    )
-    acc = pgm.compute_pkv_lora_trans(p, kv_lora_trans, None, acc)
+    acc = pgm.compute_pkv_lora_trans(p, kv_lora_trans_prefetched, None, acc)
     return L, M, acc
 
 
@@ -118,6 +122,9 @@ def process_tile_fp8(
     wait_rope: gl.constexpr,
     IS_LAST: gl.constexpr,
 ):
+    kv_lora_trans_prefetched = pgm.lds_unshuffle_kv_lora_trans(buffer_id).load(
+        layout=pgm.cfg.V_DOT_LAYOUT
+    )
     S = compute_qk_tile_fp8(
         pgm,
         buffer_id,
@@ -128,7 +135,7 @@ def process_tile_fp8(
         wait_rope,
         IS_LAST,
     )
-    return finish_tile_fp8(pgm, S, L, M, acc, buffer_id)
+    return finish_tile_fp8(pgm, S, L, M, acc, kv_lora_trans_prefetched)
 
 
 _mla_decode_fwd_kernel_prefetch_repr = make_kernel_repr(
