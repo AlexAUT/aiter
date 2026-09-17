@@ -77,6 +77,7 @@ def select_3d_config(
     attn_waves_per_eu = 1
     reduce_waves_per_eu = 2
     num_segments = 0
+    use_fp8_stage4 = False
     TILE_SIZE = block_size
     if IS_DEVICE_ARCH_GFX12:
         # If we cannot infer max_seqlen_k during graph capture
@@ -96,6 +97,11 @@ def select_3d_config(
         num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
         num_segments = min(MAX_SEGMENTS, num_segments)
         num_segments = triton.next_power_of_2(num_segments)
+        if q_dtype == e4m3_dtype and kv_dtype == e4m3_dtype:
+            use_fp8_stage4 = num_segments != 8
+            if num_segments >= 16 or num_segments <= 2:
+                max_power_of_2_segments = 1 << int(math.log2(MAX_SEGMENTS))
+                num_segments = min(max_power_of_2_segments, num_segments * 4)
 
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     if num_segments == 0:
@@ -114,7 +120,11 @@ def select_3d_config(
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": attn_num_warps,
         "waves_per_eu": attn_waves_per_eu,
-        "num_stages": 2 if DEVICE_ARCH in ("gfx1250", "gfx950") else 1,
+        "num_stages": (
+            4
+            if DEVICE_ARCH == "gfx1250" and use_fp8_stage4
+            else (2 if DEVICE_ARCH in ("gfx1250", "gfx950") else 1)
+        ),
     }
     reduce_config = {
         "TILE_SIZE": TILE_SIZE,

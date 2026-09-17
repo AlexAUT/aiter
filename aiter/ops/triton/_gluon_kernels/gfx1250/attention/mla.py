@@ -254,12 +254,22 @@ class MLAConfig:
                     if self.QUERY_DTYPE == "fp8"
                     else self.QK_WMMA_LAYOUT
                 ),
-                k_width=self.K_WIDTH,
+                k_width=(
+                    32
+                    if self.KV_CACHE_DTYPE == "fp8" and self.NUM_STAGES == 4
+                    else self.K_WIDTH
+                ),
             )
         )
         self.K_DOT_LAYOUT = gl.constexpr(
             gl.DotOperandLayout(
-                operand_index=1, parent=self.QK_WMMA_LAYOUT, k_width=self.K_WIDTH
+                operand_index=1,
+                parent=self.QK_WMMA_LAYOUT,
+                k_width=(
+                    32
+                    if self.KV_CACHE_DTYPE == "fp8" and self.NUM_STAGES == 4
+                    else self.K_WIDTH
+                ),
             )
         )
         self.P_DOT_LAYOUT = gl.constexpr(
@@ -267,9 +277,13 @@ class MLAConfig:
                 operand_index=0,
                 parent=self.PV_WMMA_LAYOUT,
                 k_width=(
-                    self.K_WIDTH
-                    if self.KV_CACHE_DTYPE != "nvfp4"
-                    else (self.K_WIDTH * 2)
+                    32
+                    if self.KV_CACHE_DTYPE == "fp8" and self.NUM_STAGES == 4
+                    else (
+                        self.K_WIDTH
+                        if self.KV_CACHE_DTYPE != "nvfp4"
+                        else (self.K_WIDTH * 2)
+                    )
                 ),
             )
         )
@@ -278,9 +292,13 @@ class MLAConfig:
                 operand_index=1,
                 parent=self.PV_WMMA_LAYOUT,
                 k_width=(
-                    self.K_WIDTH
-                    if self.KV_CACHE_DTYPE != "nvfp4"
-                    else (self.K_WIDTH * 2)
+                    32
+                    if self.KV_CACHE_DTYPE == "fp8" and self.NUM_STAGES == 4
+                    else (
+                        self.K_WIDTH
+                        if self.KV_CACHE_DTYPE != "nvfp4"
+                        else (self.K_WIDTH * 2)
+                    )
                 ),
             )
         )
@@ -1171,6 +1189,69 @@ class MLAProgram:
         return acc
 
     @gluon.jit
+    def compute_qk_tile_fp8(
+        self,
+        buffer_id,
+        tile_idx,
+        qk_factor,
+        wait_lora: gl.constexpr,
+        wait_rope: gl.constexpr,
+        IS_LAST: gl.constexpr,
+    ):
+        S = gl.zeros(
+            [self.cfg.BLOCK_M, self.cfg.TILE_SIZE],
+            dtype=tl.float32,
+            layout=self.cfg.QK_WMMA_UNPACKED_LAYOUT,
+        )
+        kv_lora = self.tdm_shared_load_kv_lora(wait_lora, buffer_id)
+        S = self.compute_qk_lora(kv_lora, None, None, S)
+        k_rope = self.tdm_shared_load_k_rope(wait_rope, buffer_id)
+        S = self.compute_qk_rope(k_rope, None, None, S) * qk_factor
+
+        if IS_LAST:
+            seq_offset = tile_idx * self.cfg.TILE_SIZE + gl.arange(
+                0,
+                self.cfg.TILE_SIZE,
+                layout=gl.SliceLayout(0, self.cfg.QK_WMMA_UNPACKED_LAYOUT),
+            )
+            seq_mask = seq_offset[None, :] < self.context_len + self.query_pos_qk + 1
+            S = gl.where(seq_mask, S, float("-inf"))
+        return S
+
+    @gluon.jit
+    def finish_tile_fp8(self, S, L, M, acc, buffer_id):
+        p, alpha, M = self.softmax_part0(S, M)
+        p, L, acc = self.softmax_part1(p, L, acc, alpha)
+        kv_lora_trans = self.lds_unshuffle_kv_lora_trans(buffer_id).load(
+            layout=self.cfg.V_DOT_LAYOUT
+        )
+        acc = self.compute_pkv_lora_trans(p, kv_lora_trans, None, acc)
+        return L, M, acc
+
+    @gluon.jit
+    def process_tile_fp8(
+        self,
+        L,
+        M,
+        acc,
+        buffer_id,
+        tile_idx,
+        qk_factor,
+        wait_lora: gl.constexpr,
+        wait_rope: gl.constexpr,
+        IS_LAST: gl.constexpr,
+    ):
+        S = self.compute_qk_tile_fp8(
+            buffer_id,
+            tile_idx,
+            qk_factor,
+            wait_lora,
+            wait_rope,
+            IS_LAST,
+        )
+        return self.finish_tile_fp8(S, L, M, acc, buffer_id)
+
+    @gluon.jit
     def tdm_shared_load_and_compute_pv_lora_trans_split_head(
         self, p, acc0, acc1, wait_count, buffer_id, scales_dtype
     ):
@@ -1550,7 +1631,7 @@ def _mla_decode_fwd_kernel(
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
     assert SHUFFLED_KV_CACHE
-    assert num_stages == 2
+    assert num_stages == 2 or num_stages == 4
 
     cfg = MLAConfig(
         KV_LORA_RANK,
@@ -1858,6 +1939,157 @@ def _mla_decode_fwd_kernel(
         L, M, acc0, acc1 = pgm.allocate_accumulator()
     else:
         L, M, acc = pgm.allocate_accumulator()
+
+    if num_stages == 4:
+        assert QUERY_DTYPE == "fp8" and KV_CACHE_DTYPE == "fp8"
+        j_hbm_start: gl.int32 = segm_idx * tiles_per_segment
+        num_tiles_this_seg: gl.int32 = pgm.tile_end - pgm.tile_start
+        j_hbm: gl.int32 = 0
+        buffer_id: gl.int32 = 0
+
+        j_hbm, physical_block_idx = pgm.load_physical_block_idx(
+            j_hbm, block_tables_ptr_shifted, j_hbm_start
+        )
+        row_offsets = pgm.get_kv_buffer_row_offsets(physical_block_idx)
+        pgm.tdm_load_global_to_shared_kv_lora(row_offsets, 0)
+        pgm.tdm_load_global_to_shared_k_rope(row_offsets, 0)
+
+        if num_tiles_this_seg > 2:
+            j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
+                j_hbm, block_tables_ptr_shifted, j_hbm_start, num_tiles_this_seg
+            )
+            row_offsets = pgm.get_kv_buffer_row_offsets(next_physical_block_idx)
+            pgm.tdm_load_global_to_shared_kv_lora(row_offsets, 1)
+            pgm.tdm_load_global_to_shared_k_rope(row_offsets, 1)
+
+            j_hbm, next_next_physical_block_idx = (
+                pgm.load_physical_block_idx_with_mod(
+                    j_hbm, block_tables_ptr_shifted, j_hbm_start, num_tiles_this_seg
+                )
+            )
+            row_offsets = pgm.get_kv_buffer_row_offsets(
+                next_next_physical_block_idx
+            )
+            pgm.tdm_load_global_to_shared_kv_lora(row_offsets, 2)
+            pgm.tdm_load_global_to_shared_k_rope(row_offsets, 2)
+
+            j_hbm, future_physical_block_idx = pgm.load_physical_block_idx_with_mod(
+                j_hbm, block_tables_ptr_shifted, j_hbm_start, num_tiles_this_seg
+            )
+            for tile_idx in range(pgm.tile_start, pgm.tile_end - 3):
+                fill_buffer_id = (buffer_id + 3) % 4
+                row_offsets = pgm.get_kv_buffer_row_offsets(future_physical_block_idx)
+                pgm.tdm_load_global_to_shared_kv_lora(row_offsets, fill_buffer_id)
+                pgm.tdm_load_global_to_shared_k_rope(row_offsets, fill_buffer_id)
+                L, M, acc = pgm.process_tile_fp8(
+                    L,
+                    M,
+                    acc,
+                    buffer_id,
+                    tile_idx,
+                    qk_factor,
+                    wait_lora=7,
+                    wait_rope=6,
+                    IS_LAST=False,
+                )
+
+                j_hbm, future_physical_block_idx = (
+                    pgm.load_physical_block_idx_with_mod(
+                        j_hbm,
+                        block_tables_ptr_shifted,
+                        j_hbm_start,
+                        num_tiles_this_seg,
+                    )
+                )
+                buffer_id = (buffer_id + 1) % 4
+
+            L, M, acc = pgm.process_tile_fp8(
+                L,
+                M,
+                acc,
+                buffer_id,
+                pgm.tile_end - 3,
+                qk_factor,
+                wait_lora=5,
+                wait_rope=4,
+                IS_LAST=False,
+            )
+            buffer_id = (buffer_id + 1) % 4
+            L, M, acc = pgm.process_tile_fp8(
+                L,
+                M,
+                acc,
+                buffer_id,
+                pgm.tile_end - 2,
+                qk_factor,
+                wait_lora=3,
+                wait_rope=2,
+                IS_LAST=False,
+            )
+            buffer_id = (buffer_id + 1) % 4
+            L, M, acc = pgm.process_tile_fp8(
+                L,
+                M,
+                acc,
+                buffer_id,
+                pgm.tile_end - 1,
+                qk_factor,
+                wait_lora=1,
+                wait_rope=0,
+                IS_LAST=True,
+            )
+        elif num_tiles_this_seg > 1:
+            j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
+                j_hbm, block_tables_ptr_shifted, j_hbm_start, num_tiles_this_seg
+            )
+            row_offsets = pgm.get_kv_buffer_row_offsets(next_physical_block_idx)
+            pgm.tdm_load_global_to_shared_kv_lora(row_offsets, 1)
+            pgm.tdm_load_global_to_shared_k_rope(row_offsets, 1)
+            L, M, acc = pgm.process_tile_fp8(
+                L,
+                M,
+                acc,
+                0,
+                pgm.tile_end - 2,
+                qk_factor,
+                wait_lora=3,
+                wait_rope=2,
+                IS_LAST=False,
+            )
+            L, M, acc = pgm.process_tile_fp8(
+                L,
+                M,
+                acc,
+                1,
+                pgm.tile_end - 1,
+                qk_factor,
+                wait_lora=1,
+                wait_rope=0,
+                IS_LAST=True,
+            )
+        else:
+            L, M, acc = pgm.process_tile_fp8(
+                L,
+                M,
+                acc,
+                0,
+                pgm.tile_end - 1,
+                qk_factor,
+                wait_lora=1,
+                wait_rope=0,
+                IS_LAST=True,
+            )
+
+        if cfg.NUM_SEGMENTS_PER_SEQ == 1:
+            one_over_L = gl.convert_layout(
+                1.0 / L[:, None], layout=cfg.PV_WMMA_LAYOUT
+            )
+            acc *= one_over_L
+        acc *= out_factor
+        if cfg.NUM_SEGMENTS_PER_SEQ == 1 and segm_output_ptr.type.element_ty.is_fp8():
+            acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+        pgm.store_output_3D(acc, M, L, segm_idx)
+        return
 
     j_hbm_start: gl.int32 = segm_idx * tiles_per_segment
     max_num_tiles_this_seg: gl.int32 = pgm.tile_end - pgm.tile_start
