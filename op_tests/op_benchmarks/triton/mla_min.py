@@ -26,12 +26,14 @@ Run directly to check against a torch reference and benchmark:
 from __future__ import annotations
 
 import argparse
+import os
 
 import torch
 import triton
 import triton.experimental.gluon.language as gl
 import triton.language as tl
 from triton.experimental import gluon
+from triton._C.libtriton.gluon_ir import make_cga_layout
 
 E4M3 = torch.float8_e4m3fn
 
@@ -56,37 +58,96 @@ K_WIDTH = gl.constexpr(16)
 DOT_K_WIDTH = 32
 
 # ---------------------------------------------------------------------------
+# Two-CTA cluster variant
+#
+# The block stays 128 query heads wide, but a CGA layout splits the M axis
+# across two CTAs, so each CTA physically holds 64 rows. That halves the two
+# dominant register consumers: acc 512 -> 256 VGPRs and Q 144 -> 72.
+#
+# The KV pages are identical for both CTAs, so their shared layout gets
+# ctaSplitNum 1 on the CTA axis: the data is replicated rather than
+# partitioned, which is what turns the TDM load into a multicast and keeps HBM
+# traffic at one read per page instead of two.
+# ---------------------------------------------------------------------------
+CTAS = int(os.environ.get("MLA_MIN_CTAS", "1"))
+if CTAS > 1:
+    # Distributed tensors: partition M (dim 0) across the CTAs.
+    CGA_SPLIT_M = make_cga_layout([CTAS, 1], [CTAS, 1], [1, 0])
+    # Shared KV pages: replicate across the CTAs (ctaSplitNum 1 on the CTA
+    # axis), which is what makes the TDM load a multicast.
+    CGA_BCAST = make_cga_layout([CTAS, 1], [1, 1], [1, 0])
+else:
+    CGA_SPLIT_M = []
+    CGA_BCAST = []
+
+
+# ---------------------------------------------------------------------------
 # Layouts
 # ---------------------------------------------------------------------------
 QK_WMMA: gl.constexpr = gl.amd.AMDWMMALayout(
     version=3, transposed=True, warp_bases=[(1, 0), (2, 0)], reg_bases=[],
-    instr_shape=[16, 16, 64],
+    instr_shape=[16, 16, 64], cga_layout=CGA_SPLIT_M,
 )
-PV_WMMA: gl.constexpr = gl.amd.AMDWMMALayout(
+# Two PV warp tilings.
+#
+#   "n" (production): warps split the 512 output columns. Each warp reads only
+#   its quarter of V, but needs all 128 rows of P -- and QK hands it only 32,
+#   so P and alpha must transit LDS. That round trip is what costs the barriers
+#   and full drains in the hot loop.
+#
+#   "m": warps split the 128 rows, matching QK. P and alpha then stay
+#   warp-local and the LDS round trip disappears, but every warp now needs all
+#   512 columns of V, so the V read is replicated four times.
+PV_WMMA_N: gl.constexpr = gl.amd.AMDWMMALayout(
     version=3, transposed=True, warp_bases=[(0, 1), (0, 2)], reg_bases=[],
-    instr_shape=[16, 16, 64],
+    instr_shape=[16, 16, 64], cga_layout=CGA_SPLIT_M,
 )
+PV_WMMA_M: gl.constexpr = gl.amd.AMDWMMALayout(
+    version=3, transposed=True, warp_bases=[(1, 0), (2, 0)], reg_bases=[],
+    instr_shape=[16, 16, 64], cga_layout=CGA_SPLIT_M,
+)
+#   "h": two warps on M, two on N. Halves both penalties -- V is replicated
+#   twice instead of four times, and the P exchange is between warp pairs
+#   rather than a broadcast to all four.
+PV_WMMA_H: gl.constexpr = gl.amd.AMDWMMALayout(
+    version=3, transposed=True, warp_bases=[(1, 0), (0, 1)], reg_bases=[],
+    instr_shape=[16, 16, 64], cga_layout=CGA_SPLIT_M,
+)
+PV_WMMA: gl.constexpr = PV_WMMA_N  # default; overridden per launch
+
 Q_DOT: gl.constexpr = gl.DotOperandLayout(0, QK_WMMA, DOT_K_WIDTH)
 K_DOT: gl.constexpr = gl.DotOperandLayout(1, QK_WMMA, DOT_K_WIDTH)
-P_DOT: gl.constexpr = gl.DotOperandLayout(0, PV_WMMA, DOT_K_WIDTH)
-V_DOT: gl.constexpr = gl.DotOperandLayout(1, PV_WMMA, DOT_K_WIDTH)
+P_DOT_N: gl.constexpr = gl.DotOperandLayout(0, PV_WMMA_N, DOT_K_WIDTH)
+V_DOT_N: gl.constexpr = gl.DotOperandLayout(1, PV_WMMA_N, DOT_K_WIDTH)
+P_DOT_M: gl.constexpr = gl.DotOperandLayout(0, PV_WMMA_M, DOT_K_WIDTH)
+V_DOT_M: gl.constexpr = gl.DotOperandLayout(1, PV_WMMA_M, DOT_K_WIDTH)
+P_DOT_H: gl.constexpr = gl.DotOperandLayout(0, PV_WMMA_H, DOT_K_WIDTH)
+V_DOT_H: gl.constexpr = gl.DotOperandLayout(1, PV_WMMA_H, DOT_K_WIDTH)
+
+_PV = {"n": (PV_WMMA_N, P_DOT_N, V_DOT_N),
+       "m": (PV_WMMA_M, P_DOT_M, V_DOT_M),
+       "h": (PV_WMMA_H, P_DOT_H, V_DOT_H)}
+
+
 
 Q_LORA_SMEM: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-    [[KV_LORA_RANK.value, 8]], [BLOCK_M.value, KV_LORA_RANK.value], [1, 0]
+    [[KV_LORA_RANK.value, 8]], [BLOCK_M.value, KV_LORA_RANK.value], [1, 0],
+    CGA_SPLIT_M,
 )
 Q_ROPE_SMEM: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-    [[QK_ROPE_HEAD_DIM.value, 8]], [BLOCK_M.value, QK_ROPE_HEAD_DIM.value], [1, 0]
+    [[QK_ROPE_HEAD_DIM.value, 8]], [BLOCK_M.value, QK_ROPE_HEAD_DIM.value], [1, 0],
+    CGA_SPLIT_M,
 )
 KV_SMEM: gl.constexpr = gl.SwizzledSharedLayout(
-    vec=1, per_phase=1, max_phase=1, order=[1, 0]
+    vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=CGA_BCAST
 )
 Q_LORA_LOAD: gl.constexpr = gl.BlockedLayout(
     size_per_thread=[1, 8], threads_per_warp=[1, 32], warps_per_cta=[NUM_WARPS, 1],
-    order=[1, 0],
+    order=[1, 0], cga_layout=CGA_SPLIT_M,
 )
 Q_ROPE_LOAD: gl.constexpr = gl.BlockedLayout(
     size_per_thread=[1, 8], threads_per_warp=[4, 8], warps_per_cta=[NUM_WARPS, 1],
-    order=[1, 0],
+    order=[1, 0], cga_layout=CGA_SPLIT_M,
 )
 
 
@@ -126,17 +187,45 @@ def _process_tile(
     q_lora, q_rope, kv_lora_smem, k_rope_smem, buffer_id, tile_idx,
     qk_factor, seq_len, L, M, acc,
     wait_lora: gl.constexpr, wait_rope: gl.constexpr, IS_LAST: gl.constexpr,
+    SCHED: gl.constexpr, PVL: gl.constexpr, PDOT: gl.constexpr, VDOT: gl.constexpr,
 ):
+    """Schedules (SCHED), all numerically identical:
+
+    0  baseline: wait/read/dot per operand, V read after softmax
+    1  rope-early: both K reads issued before either QK dot
+    2  v-early: V read issued before softmax, so its latency hides behind it
+    3  rope-early + v-early
+    4  v-first: V read issued before the QK dots (longest live range)
+    """
     # --- S = Q @ K^T over the 576-deep reduction, in two WMMA groups --------
     S = gl.zeros([BLOCK_M, BLOCK_SIZE], dtype=tl.float32, layout=QK_WMMA)
 
-    gl.amd.gfx1250.tdm.async_wait(wait_lora)
-    k_lora = _unshuffle_lora(kv_lora_smem, buffer_id).permute((1, 0)).load(layout=K_DOT)
-    S = gl.amd.gfx1250.wmma(q_lora, k_lora, S)
+    if SCHED == 4:
+        gl.amd.gfx1250.tdm.async_wait(wait_lora)
+        v = _unshuffle_lora(kv_lora_smem, buffer_id).load(layout=VDOT)
 
-    gl.amd.gfx1250.tdm.async_wait(wait_rope)
-    k_rope = _unshuffle_rope(k_rope_smem, buffer_id).permute((1, 0)).load(layout=K_DOT)
-    S = gl.amd.gfx1250.wmma(q_rope, k_rope, S) * qk_factor
+    if SCHED == 1 or SCHED == 3:
+        gl.amd.gfx1250.tdm.async_wait(wait_lora)
+        k_lora = (
+            _unshuffle_lora(kv_lora_smem, buffer_id).permute((1, 0)).load(layout=K_DOT)
+        )
+        gl.amd.gfx1250.tdm.async_wait(wait_rope)
+        k_rope = (
+            _unshuffle_rope(k_rope_smem, buffer_id).permute((1, 0)).load(layout=K_DOT)
+        )
+        S = gl.amd.gfx1250.wmma(q_lora, k_lora, S)
+        S = gl.amd.gfx1250.wmma(q_rope, k_rope, S) * qk_factor
+    else:
+        gl.amd.gfx1250.tdm.async_wait(wait_lora)
+        k_lora = (
+            _unshuffle_lora(kv_lora_smem, buffer_id).permute((1, 0)).load(layout=K_DOT)
+        )
+        S = gl.amd.gfx1250.wmma(q_lora, k_lora, S)
+        gl.amd.gfx1250.tdm.async_wait(wait_rope)
+        k_rope = (
+            _unshuffle_rope(k_rope_smem, buffer_id).permute((1, 0)).load(layout=K_DOT)
+        )
+        S = gl.amd.gfx1250.wmma(q_rope, k_rope, S) * qk_factor
 
     if IS_LAST:
         # Only the final tile can run past the end of the sequence. With one
@@ -146,17 +235,22 @@ def _process_tile(
         )
         S = gl.where(pos[None, :] < seq_len, S, float("-inf"))
 
+    # --- V read, optionally issued before the softmax -----------------------
+    if SCHED == 2 or SCHED == 3:
+        v = _unshuffle_lora(kv_lora_smem, buffer_id).load(layout=VDOT)
+
     # --- online softmax over the 64 KV positions of this tile ---------------
     m_ij = gl.maximum(M, gl.max(S, axis=1))
     p = gl.exp2(S - m_ij[:, None])
     alpha = gl.exp2(M - m_ij)
     M = m_ij
     L = L * alpha + gl.sum(p, 1)
-    acc = acc * gl.convert_layout(alpha[:, None], layout=PV_WMMA)
+    acc = acc * gl.convert_layout(alpha[:, None], layout=PVL)
 
     # --- acc += P @ V, V being the same LDS page read untransposed ----------
-    v = _unshuffle_lora(kv_lora_smem, buffer_id).load(layout=V_DOT)
-    p = gl.convert_layout(p.to(v.dtype), P_DOT)
+    if SCHED == 0 or SCHED == 1:
+        v = _unshuffle_lora(kv_lora_smem, buffer_id).load(layout=VDOT)
+    p = gl.convert_layout(p.to(v.dtype), PDOT)
     acc = gl.amd.gfx1250.wmma(p, v, acc)
     return L, M, acc
 
@@ -166,7 +260,7 @@ def mla_decode_min_kernel(
     out_ptr,  # [num_seqs, NUM_QUERY_HEADS, KV_LORA_RANK]
     query_ptr,  # [num_seqs, NUM_QUERY_HEADS, HEAD_SIZE] fp8
     kv_buffer_ptr,  # [num_blocks, 1, BLOCK_SIZE, HEAD_SIZE] fp8, shuffled
-    block_tables_ptr,  # [num_seqs, max_blocks_per_seq]
+    block_tables_ptr: tl.const,  # [num_seqs, max_blocks_per_seq]
     seq_lens_ptr,  # [num_seqs]
     q_descale_ptr,
     kv_descale_ptr,
@@ -178,6 +272,12 @@ def mla_decode_min_kernel(
     out_stride_1: gl.int64,
     kv_page_stride: gl.int32,
     num_pages: gl.int32,
+    SCHED: gl.constexpr,
+    STAGES: gl.constexpr,
+    PVL: gl.constexpr,
+    PDOT: gl.constexpr,
+    VDOT: gl.constexpr,
+    PGPF: gl.constexpr,
 ):
     seq_idx = gl.program_id(0)
     seq_len = gl.load(seq_lens_ptr + seq_idx)
@@ -232,10 +332,10 @@ def mla_decode_min_kernel(
         layout=KV_SMEM,
     )
     kv_lora_smem = gl.allocate_shared_memory(
-        kv_lora_desc.dtype, [NUM_STAGES] + kv_lora_desc.block_shape, KV_SMEM
+        kv_lora_desc.dtype, [STAGES] + kv_lora_desc.block_shape, KV_SMEM
     )
     k_rope_smem = gl.allocate_shared_memory(
-        k_rope_desc.dtype, [NUM_STAGES] + k_rope_desc.block_shape, KV_SMEM
+        k_rope_desc.dtype, [STAGES] + k_rope_desc.block_shape, KV_SMEM
     )
 
     table = block_tables_ptr + seq_idx * block_tables_stride
@@ -243,52 +343,69 @@ def mla_decode_min_kernel(
     # ---- accumulators ------------------------------------------------------
     M = gl.full([BLOCK_M], float("-inf"), gl.float32, gl.SliceLayout(1, QK_WMMA))
     L = gl.full([BLOCK_M], 1.0, gl.float32, gl.SliceLayout(1, QK_WMMA))
-    acc = gl.zeros([BLOCK_M, KV_LORA_RANK], dtype=gl.float32, layout=PV_WMMA)
+    acc = gl.zeros([BLOCK_M, KV_LORA_RANK], dtype=gl.float32, layout=PVL)
 
-    # ---- prologue: prime 3 of the 4 slots ----------------------------------
-    for prime in gl.static_range(3):
+    # Each tile issues two TDM loads, so with DEPTH tiles in flight there are
+    # 2*STAGES outstanding transfers at the top of a steady-state iteration;
+    # async_wait(2*STAGES-1) retires exactly this tile's kv_lora and
+    # async_wait(2*STAGES-2) its k_rope.
+    DEPTH: gl.constexpr = STAGES - 1
+
+    # ---- prologue: prime DEPTH of the STAGES slots -------------------------
+    for prime in gl.static_range(DEPTH):
         pg = gl.load(table + gl.minimum(prime, num_tiles - 1))
         _load_page(kv_lora_desc, kv_lora_smem, pg, prime)
         _load_page(k_rope_desc, k_rope_smem, pg, prime)
 
-    # ---- steady state: load 3 tiles ahead, consume the oldest slot ---------
+    # ---- steady state: load DEPTH tiles ahead, consume the oldest slot -----
     slot: gl.int32 = 0
-    for tile in range(0, num_tiles - 3):
-        pg = gl.load(table + gl.minimum(tile + 3, num_tiles - 1))
-        fill_slot = (slot + 3) % NUM_STAGES
-        _load_page(kv_lora_desc, kv_lora_smem, pg, fill_slot)
-        _load_page(k_rope_desc, k_rope_smem, pg, fill_slot)
-        L, M, acc = _process_tile(
-            q_lora, q_rope, kv_lora_smem, k_rope_smem, slot, tile,
-            qk_factor, seq_len, L, M, acc,
-            wait_lora=7, wait_rope=6, IS_LAST=False,
-        )
-        slot = (slot + 1) % NUM_STAGES
+    if PGPF:
+        # The page index gates the TDM issue, so fetching it in the same
+        # iteration exposes its full latency. Fetch it one iteration ahead and
+        # carry it in a register, so the load overlaps the tile compute.
+        pg = gl.load(table + gl.minimum(DEPTH, num_tiles - 1))
+        for tile in range(0, num_tiles - DEPTH):
+            fill_slot = (slot + DEPTH) % STAGES
+            _load_page(kv_lora_desc, kv_lora_smem, pg, fill_slot)
+            _load_page(k_rope_desc, k_rope_smem, pg, fill_slot)
+            pg = gl.load(table + gl.minimum(tile + 1 + DEPTH, num_tiles - 1))
+            L, M, acc = _process_tile(
+                q_lora, q_rope, kv_lora_smem, k_rope_smem, slot, tile,
+                qk_factor, seq_len, L, M, acc,
+                wait_lora=2 * STAGES - 1, wait_rope=2 * STAGES - 2,
+                IS_LAST=False, SCHED=SCHED, PVL=PVL, PDOT=PDOT, VDOT=VDOT,
+            )
+            slot = (slot + 1) % STAGES
+    else:
+        for tile in range(0, num_tiles - DEPTH):
+            pg = gl.load(table + gl.minimum(tile + DEPTH, num_tiles - 1))
+            fill_slot = (slot + DEPTH) % STAGES
+            _load_page(kv_lora_desc, kv_lora_smem, pg, fill_slot)
+            _load_page(k_rope_desc, k_rope_smem, pg, fill_slot)
+            L, M, acc = _process_tile(
+                q_lora, q_rope, kv_lora_smem, k_rope_smem, slot, tile,
+                qk_factor, seq_len, L, M, acc,
+                wait_lora=2 * STAGES - 1, wait_rope=2 * STAGES - 2,
+                IS_LAST=False, SCHED=SCHED, PVL=PVL, PDOT=PDOT, VDOT=VDOT,
+            )
+            slot = (slot + 1) % STAGES
 
-    # ---- drain: three tiles with no new loads in flight --------------------
-    L, M, acc = _process_tile(
-        q_lora, q_rope, kv_lora_smem, k_rope_smem, slot, num_tiles - 3,
-        qk_factor, seq_len, L, M, acc,
-        wait_lora=5, wait_rope=4, IS_LAST=False,
-    )
-    slot = (slot + 1) % NUM_STAGES
-    L, M, acc = _process_tile(
-        q_lora, q_rope, kv_lora_smem, k_rope_smem, slot, num_tiles - 2,
-        qk_factor, seq_len, L, M, acc,
-        wait_lora=3, wait_rope=2, IS_LAST=False,
-    )
-    slot = (slot + 1) % NUM_STAGES
-    L, M, acc = _process_tile(
-        q_lora, q_rope, kv_lora_smem, k_rope_smem, slot, num_tiles - 1,
-        qk_factor, seq_len, L, M, acc,
-        wait_lora=1, wait_rope=0, IS_LAST=True,
-    )
+    # ---- drain: DEPTH tiles with no new loads in flight --------------------
+    for k in gl.static_range(DEPTH):
+        L, M, acc = _process_tile(
+            q_lora, q_rope, kv_lora_smem, k_rope_smem, slot,
+            num_tiles - DEPTH + k,
+            qk_factor, seq_len, L, M, acc,
+            wait_lora=2 * (DEPTH - k) - 1, wait_rope=2 * (DEPTH - k) - 2,
+            IS_LAST=(k == DEPTH - 1), SCHED=SCHED, PVL=PVL, PDOT=PDOT, VDOT=VDOT,
+        )
+        slot = (slot + 1) % STAGES
 
     # ---- epilogue ----------------------------------------------------------
-    acc = acc * gl.convert_layout(1.0 / L[:, None], layout=PV_WMMA) * out_factor
+    acc = acc * gl.convert_layout(1.0 / L[:, None], layout=PVL) * out_factor
 
-    offs_m_o = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, PV_WMMA))
-    offs_d_o = gl.arange(0, KV_LORA_RANK, layout=gl.SliceLayout(0, PV_WMMA))
+    offs_m_o = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, PVL))
+    offs_d_o = gl.arange(0, KV_LORA_RANK, layout=gl.SliceLayout(0, PVL))
     o_offs = (
         seq_idx * out_stride_0
         + offs_m_o[:, None] * out_stride_1
@@ -301,7 +418,7 @@ def mla_decode_min_kernel(
 # Host wrapper
 # ---------------------------------------------------------------------------
 def mla_decode_min(q, kv_buffer, block_tables, seq_lens, q_descale, kv_descale,
-                   softmax_scale, out=None, out_dtype=torch.bfloat16):
+                   softmax_scale, out=None, out_dtype=torch.bfloat16, sched=0, stages=NUM_STAGES.value, pvsplit="n", pgpf=False):
     # Caller must ensure every sequence spans more than three KV pages
     # (seq_len > 192): the drain phase peels three tiles unconditionally.
     # Checking it here would force a device sync on every launch.
@@ -321,8 +438,15 @@ def mla_decode_min(q, kv_buffer, block_tables, seq_lens, q_descale, kv_descale,
         out_stride_1=out.stride(1),
         kv_page_stride=kv_buffer.stride(1),
         num_pages=kv_buffer.shape[0],
+        SCHED=sched,
+        STAGES=stages,
+        PVL=_PV[pvsplit][0],
+        PDOT=_PV[pvsplit][1],
+        VDOT=_PV[pvsplit][2],
+        PGPF=pgpf,
         num_warps=NUM_WARPS,
-        num_stages=NUM_STAGES.value,
+        num_ctas=CTAS,
+        num_stages=stages,
         waves_per_eu=1,
     )
 
@@ -383,6 +507,10 @@ def main():
     p.add_argument("--check", action="store_true", help="compare against production")
     p.add_argument("--ref", action="store_true", help="compare against torch reference")
     p.add_argument("--compare", action="store_true", help="also time the production kernel")
+    p.add_argument("--sched", type=int, default=0, help="hot-loop schedule variant (0-4)")
+    p.add_argument("--stages", type=int, default=4, help="LDS ring buffer depth")
+    p.add_argument("--pvsplit", choices=["n", "m", "h"], default="n", help="PV warp tiling")
+    p.add_argument("--pgpf", action="store_true", help="prefetch the block-table index one iteration ahead")
     args = p.parse_args()
 
     q, kv, block_tables, seq_lens, q_descale, kv_descale = _make_inputs(
@@ -395,7 +523,8 @@ def main():
     kv_shuf = shuffle_kv_buffer(kv, KV_LORA_RANK.value)
 
     out, kernel = mla_decode_min(
-        q, kv_shuf, block_tables, seq_lens, q_descale, kv_descale, scale
+        q, kv_shuf, block_tables, seq_lens, q_descale, kv_descale, scale,
+        sched=args.sched, stages=args.stages, pvsplit=args.pvsplit, pgpf=args.pgpf,
     )
     torch.cuda.synchronize()
     print(
@@ -450,13 +579,15 @@ def main():
         torch.cuda.synchronize()
         return t0.elapsed_time(t1) / args.iters * 1e3
 
-    assert int(seq_lens.min()) > 3 * BLOCK_SIZE.value, "needs seq_len > 192"
+    assert int(seq_lens.min()) > (args.stages - 1) * BLOCK_SIZE.value
     us = time_it(
         lambda: mla_decode_min(
-            q, kv_shuf, block_tables, seq_lens, q_descale, kv_descale, scale, out=out
+            q, kv_shuf, block_tables, seq_lens, q_descale, kv_descale, scale,
+            out=out, sched=args.sched, stages=args.stages, pvsplit=args.pvsplit,
+            pgpf=args.pgpf,
         )
     )
-    print(f"mla_min    batch {args.batch_size}: {us:8.2f} us   {mem / (us * 1e-6):.3f} TB/s")
+    print(f"mla_min s{args.sched} st{args.stages} pv{args.pvsplit} cta{CTAS} pf{int(args.pgpf)} batch {args.batch_size}: {us:8.2f} us   {mem / (us * 1e-6):.3f} TB/s")
 
     if args.compare:
         from aiter.ops.triton.attention.mla import mla_decode_fwd
