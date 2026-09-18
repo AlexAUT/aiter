@@ -1,6 +1,7 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 import math
+import os
 
 import torch
 import triton
@@ -99,9 +100,6 @@ def select_3d_config(
         num_segments = triton.next_power_of_2(num_segments)
         if q_dtype == e4m3_dtype and kv_dtype == e4m3_dtype:
             use_fp8_stage4 = num_segments != 8
-            if num_segments >= 16 or num_segments <= 2:
-                max_power_of_2_segments = 1 << int(math.log2(MAX_SEGMENTS))
-                num_segments = min(max_power_of_2_segments, num_segments * 4)
 
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     if num_segments == 0:
@@ -414,6 +412,14 @@ def mla_decode_fwd(
     if IS_DEVICE_ARCH_GFX12:
         if shuffled_kv_cache:
             impl = gluon_mla_decode_fwd_kernel
+            # Experiment switch: route to the standalone prototype kernel so the
+            # mla_prefetch.py variants can be benchmarked through the normal path.
+            if os.environ.get("AITER_MLA_PROTO") == "1":
+                from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla_prefetch import (  # noqa: E501
+                    _mla_decode_fwd_kernel_prefetch,
+                )
+
+                impl = _mla_decode_fwd_kernel_prefetch
         else:
             impl = gluon_mla_decode_fwd_kernel_non_pipelined
 

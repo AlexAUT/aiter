@@ -239,9 +239,11 @@ def benchmark(args):
             * 2
             * kv_dtype.itemsize
         )
-        if decode_qlen > 0 and skip_reduce:
+        # With a single segment there is nothing to reduce, so mla_decode_fwd
+        # returns the final output even when skip_reduce is set.
+        if decode_qlen > 0 and skip_reduce and isinstance(out, tuple):
             assert (
-                isinstance(out, tuple) and len(out) == 3
+                len(out) == 3
             ), "Output should be a tuple of 3 tensors for skip_reduce and decode_qlen > 0 1"
             segm_output, segm_max, segm_expsum = out
             mem_out = (
@@ -301,6 +303,18 @@ def benchmark(args):
     # return x_vals_list, x_names, line_vals
 
 
+# argparse lacks support for boolean argument type (sigh...)
+def str2bool(v):
+    if isinstance(v, bool) or v is None:
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    elif v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    else:
+        raise argparse.ArgumentTypeError("Boolean value expected.")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         prog="Benchmark MLA Decode/Prefill",
@@ -314,15 +328,15 @@ def parse_args():
     parser.add_argument("--kv_lora_rank", type=int, default=512)
     parser.add_argument("--qk_rope_head_dim", type=int, default=64)
     parser.add_argument("--block_size", type=int, default=64)
-    parser.add_argument("--shuffled_kv_cache", type=bool, default=True)
+    parser.add_argument("--shuffled_kv_cache", type=str2bool, default=True)
     parser.add_argument("--num_query_heads", type=int, default=16)
     parser.add_argument("--num_kv_heads", type=int, default=1)
-    parser.add_argument("--varlen", type=bool, default=True)
+    parser.add_argument("--varlen", type=str2bool, default=True)
     parser.add_argument("--q_dtype", type=str, default="bf16")
     parser.add_argument("--kv_dtype", type=str, default="bf16")
     parser.add_argument("--out_dtype", type=str, default="bf16")
     parser.add_argument("--backend", type=str, default="triton")
-    parser.add_argument("--skip_reduce", type=bool, default=True)
+    parser.add_argument("--skip_reduce", type=str2bool, default=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "-metric",
@@ -344,6 +358,9 @@ def parse_args():
 
 def run_bench(args):
     torch.manual_seed(0)
+    # Sequence lengths come from the random module, so seeding torch alone
+    # leaves the reported bandwidth varying between processes.
+    random.seed(0)
     torch.set_default_device(args.device)
     benchmark(args)
 
