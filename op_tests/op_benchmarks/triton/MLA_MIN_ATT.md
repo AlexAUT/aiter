@@ -31,18 +31,29 @@ decode. Re-check this path if the environment is rebuilt.
 ## Capturing
 
 ```bash
-cd /home/aweinrau/dev/triton/aiter
-./op_tests/op_benchmarks/triton/mla_min_att_trace.sh /tmp/att_base
-./op_tests/op_benchmarks/triton/mla_min_att_trace.sh /tmp/att_pf --pgpf
-MLA_MIN_CTAS=2 ./op_tests/op_benchmarks/triton/mla_min_att_trace.sh /tmp/att_cta2
+cd /home/aweinrau/devFA/triton
+./aiter/op_tests/op_benchmarks/triton/mla_min_att_trace.sh /tmp/att_base
+./aiter/op_tests/op_benchmarks/triton/mla_min_att_trace.sh /tmp/att_pf --pgpf
+./aiter/op_tests/op_benchmarks/triton/mla_min_att_trace.sh /tmp/att_best \
+    --pgpf --sched 5 --npf 2 --pvsplit n
+MLA_MIN_CTAS=2 ./aiter/op_tests/op_benchmarks/triton/mla_min_att_trace.sh /tmp/att_cta2
 ```
 
 Any argument after the output directory is forwarded to `mla_min.py`, so all
-the variant flags work: `--sched 0..4`, `--stages N`, `--pvsplit {n,m,h}`,
-`--pgpf`. `MLA_MIN_CTAS=2` selects the 2-CTA cluster build (chosen at import
-time, so it is an environment variable rather than a flag).
+the variant flags work: `--sched 0..6`, `--npf N`, `--pfk N`, `--pfrope`,
+`--stages N`, `--pvsplit {n,m,h}`, `--pgpf`. `MLA_MIN_CTAS=2` selects the
+2-CTA cluster build (chosen at import time, so it is an environment variable
+rather than a flag).
 
-The raw command, if you need to adapt it:
+On success the script zips `$OUT` to
+`<triton-root>/mla_min_<args>_att_<YYYYMMDD>.zip` and prints an `sftp` get
+for host `b0_triton_slow` (override with `SFTP_HOST` / `ZIP_PATH`).
+
+The script always `cd`s to the triton root before launching Python, so relative
+`TRITON_OVERRIDE_DIR=build-out/override/` (and dump paths) from `defaultEnv.sh`
+apply. Do not run `mla_min.py` from `aiter/` if you are using ISA overrides.
+
+The raw command, if you need to adapt it (cwd must be the triton root):
 
 ```bash
 gpu-lock rocprofv3 \
@@ -53,8 +64,14 @@ gpu-lock rocprofv3 \
     --att-shader-engine-mask 0x1 \
     --kernel-include-regex mla_decode_min \
     -d /tmp/att_out -o att --output-format csv \
-    -- python op_tests/op_benchmarks/triton/mla_min.py \
+    -- python aiter/op_tests/op_benchmarks/triton/mla_min.py \
         --batch_size 512 --ctx_lens 16384 --iters 1
+```
+
+From your machine, after the script prints the zip path:
+
+```bash
+sftp b0_triton_slow:/home/aweinrau/devFA/triton/mla_min_<tag>_att_<YYYYMMDD>.zip
 ```
 
 `rocprofv3` also accepts `-i config.yaml` for the same options if a file is

@@ -183,6 +183,51 @@ def _load_page(desc, smem, block_idx, buffer_id):
 
 
 @gluon.jit
+def _load_k_chunk(kv_lora_smem, buffer_id, chunk: gl.constexpr, PFK: gl.constexpr):
+    """One PFK-wide K operand from an already-unshuffled LDS page."""
+    return (
+        _unshuffle_lora(kv_lora_smem, buffer_id)
+        .permute((1, 0))
+        .slice(chunk * PFK, PFK, dim=0)
+        .load(layout=K_DOT)
+    )
+
+
+@gluon.jit
+def _load_k_rope(k_rope_smem, buffer_id):
+    return _unshuffle_rope(k_rope_smem, buffer_id).permute((1, 0)).load(layout=K_DOT)
+
+
+@gluon.jit
+def _prefetch_k_operands(
+    kv_lora_smem, k_rope_smem, buffer_id,
+    wait_lora: gl.constexpr, wait_rope: gl.constexpr,
+    NPF: gl.constexpr, PFK: gl.constexpr, PFROPE: gl.constexpr,
+    k0, k1, k2, k3, k_rope,
+):
+    """Issue the next tile's LDS reads. Wait once for lora, then for rope.
+
+    Unused slots alias k0 / k_rope so they stay constexpr-dead when NPF is
+    smaller or PFROPE is off.
+    """
+    gl.amd.gfx1250.tdm.async_wait(wait_lora)
+    k0 = _load_k_chunk(kv_lora_smem, buffer_id, 0, PFK)
+    k1 = k0
+    k2 = k0
+    k3 = k0
+    if NPF >= 2:
+        k1 = _load_k_chunk(kv_lora_smem, buffer_id, 1, PFK)
+    if NPF >= 3:
+        k2 = _load_k_chunk(kv_lora_smem, buffer_id, 2, PFK)
+    if NPF >= 4:
+        k3 = _load_k_chunk(kv_lora_smem, buffer_id, 3, PFK)
+    if PFROPE:
+        gl.amd.gfx1250.tdm.async_wait(wait_rope)
+        k_rope = _load_k_rope(k_rope_smem, buffer_id)
+    return k0, k1, k2, k3, k_rope
+
+
+@gluon.jit
 def _process_tile(
     q_lora, q_rope, kv_lora_smem, k_rope_smem, buffer_id, tile_idx,
     qk_factor, seq_len, L, M, acc,
@@ -196,6 +241,9 @@ def _process_tile(
     2  v-early: V read issued before softmax, so its latency hides behind it
     3  rope-early + v-early
     4  v-first: V read issued before the QK dots (longest live range)
+
+    Schedules 5 and 6 pipeline K (and optionally RoPE) reads across
+    iterations; see `_process_tile_pf`.
     """
     # --- S = Q @ K^T over the 576-deep reduction, in two WMMA groups --------
     S = gl.zeros([BLOCK_M, BLOCK_SIZE], dtype=tl.float32, layout=QK_WMMA)
@@ -256,6 +304,98 @@ def _process_tile(
 
 
 @gluon.jit
+def _process_tile_pf(
+    q_lora, q_rope, kv_lora_smem, k_rope_smem, buffer_id, next_buffer_id, tile_idx,
+    qk_factor, seq_len, L, M, acc, k0, k1, k2, k3, k_rope_pf,
+    wait_lora: gl.constexpr, wait_rope: gl.constexpr, wait_next: gl.constexpr,
+    wait_next_rope: gl.constexpr, IS_LAST: gl.constexpr, PF_WHEN: gl.constexpr,
+    PFK: gl.constexpr, NPF: gl.constexpr, PFROPE: gl.constexpr,
+    PVL: gl.constexpr, PDOT: gl.constexpr, VDOT: gl.constexpr,
+):
+    """Schedules 5 and 6: NPF K chunks (and optionally RoPE) are prefetched.
+
+    Each `k{i}` is K rows [i*PFK, (i+1)*PFK) of *this* tile, read from LDS
+    during the previous iteration. Remaining chunks and RoPE, if not
+    prefetched, load from the current page as before. This tile then prefetches
+    the next one, either late (5, after QK) or early (6, at the top).
+    """
+    NCHUNK: gl.constexpr = KV_LORA_RANK // PFK
+    tl.static_assert(NPF >= 1)
+    tl.static_assert(NPF <= NCHUNK)
+    tl.static_assert(NCHUNK <= 4)
+
+    S = gl.zeros([BLOCK_M, BLOCK_SIZE], dtype=tl.float32, layout=QK_WMMA)
+
+    k0n, k1n, k2n, k3n, rope_n = k0, k1, k2, k3, k_rope_pf
+    if PF_WHEN == 2:
+        k0n, k1n, k2n, k3n, rope_n = _prefetch_k_operands(
+            kv_lora_smem, k_rope_smem, next_buffer_id,
+            wait_next, wait_next_rope, NPF, PFK, PFROPE,
+            k0n, k1n, k2n, k3n, rope_n,
+        )
+
+    # --- S = Q @ K^T: prefetched chunks first, then in-tile remainder ------
+    S = gl.amd.gfx1250.wmma(
+        gl.amd.slice(q_lora, [BLOCK_M, PFK], [0, 0]), k0, S
+    )
+    if NPF >= 2:
+        S = gl.amd.gfx1250.wmma(
+            gl.amd.slice(q_lora, [BLOCK_M, PFK], [0, PFK]), k1, S
+        )
+    if NPF >= 3:
+        S = gl.amd.gfx1250.wmma(
+            gl.amd.slice(q_lora, [BLOCK_M, PFK], [0, 2 * PFK]), k2, S
+        )
+    if NPF >= 4:
+        S = gl.amd.gfx1250.wmma(
+            gl.amd.slice(q_lora, [BLOCK_M, PFK], [0, 3 * PFK]), k3, S
+        )
+
+    if NPF < NCHUNK:
+        gl.amd.gfx1250.tdm.async_wait(wait_lora)
+        for chunk in gl.static_range(NPF, NCHUNK):
+            k_lora = _load_k_chunk(kv_lora_smem, buffer_id, chunk, PFK)
+            S = gl.amd.gfx1250.wmma(
+                gl.amd.slice(q_lora, [BLOCK_M, PFK], [0, chunk * PFK]), k_lora, S
+            )
+
+    if PFROPE:
+        S = gl.amd.gfx1250.wmma(q_rope, k_rope_pf, S) * qk_factor
+    else:
+        gl.amd.gfx1250.tdm.async_wait(wait_rope)
+        k_rope = _load_k_rope(k_rope_smem, buffer_id)
+        S = gl.amd.gfx1250.wmma(q_rope, k_rope, S) * qk_factor
+
+    if PF_WHEN == 1:
+        k0n, k1n, k2n, k3n, rope_n = _prefetch_k_operands(
+            kv_lora_smem, k_rope_smem, next_buffer_id,
+            wait_next, wait_next_rope, NPF, PFK, PFROPE,
+            k0n, k1n, k2n, k3n, rope_n,
+        )
+
+    if IS_LAST:
+        pos = tile_idx * BLOCK_SIZE + gl.arange(
+            0, BLOCK_SIZE, layout=gl.SliceLayout(0, QK_WMMA)
+        )
+        S = gl.where(pos[None, :] < seq_len, S, float("-inf"))
+
+    m_ij = gl.maximum(M, gl.max(S, axis=1))
+    p = gl.exp2(S - m_ij[:, None])
+    alpha = gl.exp2(M - m_ij)
+    M = m_ij
+    L = L * alpha + gl.sum(p, 1)
+    acc = acc * gl.convert_layout(alpha[:, None], layout=PVL)
+
+    # V is the same LDS page as K; wait if QK never waited on this tile.
+    if NPF == NCHUNK:
+        gl.amd.gfx1250.tdm.async_wait(wait_lora)
+    v = _unshuffle_lora(kv_lora_smem, buffer_id).load(layout=VDOT)
+    p = gl.convert_layout(p.to(v.dtype), PDOT)
+    acc = gl.amd.gfx1250.wmma(p, v, acc)
+    return L, M, acc, k0n, k1n, k2n, k3n, rope_n
+
+
+@gluon.jit
 def mla_decode_min_kernel(
     out_ptr,  # [num_seqs, NUM_QUERY_HEADS, KV_LORA_RANK]
     query_ptr,  # [num_seqs, NUM_QUERY_HEADS, HEAD_SIZE] fp8
@@ -278,6 +418,9 @@ def mla_decode_min_kernel(
     PDOT: gl.constexpr,
     VDOT: gl.constexpr,
     PGPF: gl.constexpr,
+    PFK: gl.constexpr,
+    NPF: gl.constexpr,
+    PFROPE: gl.constexpr,
 ):
     seq_idx = gl.program_id(0)
     seq_len = gl.load(seq_lens_ptr + seq_idx)
@@ -331,11 +474,15 @@ def mla_decode_min_kernel(
         block_shape=(gl.constexpr(1), BLOCK_SIZE * QK_ROPE_HEAD_DIM),
         layout=KV_SMEM,
     )
+    # See the ring comment below: prefetch schedules keep one spare slot so
+    # TDM fill cannot land on a page whose LDS reads may still be in flight.
+    DEPTH: gl.constexpr = STAGES - 1
+    RING: gl.constexpr = STAGES + 1 if SCHED >= 5 else STAGES
     kv_lora_smem = gl.allocate_shared_memory(
-        kv_lora_desc.dtype, [STAGES] + kv_lora_desc.block_shape, KV_SMEM
+        kv_lora_desc.dtype, [RING] + kv_lora_desc.block_shape, KV_SMEM
     )
     k_rope_smem = gl.allocate_shared_memory(
-        k_rope_desc.dtype, [STAGES] + k_rope_desc.block_shape, KV_SMEM
+        k_rope_desc.dtype, [RING] + k_rope_desc.block_shape, KV_SMEM
     )
 
     table = block_tables_ptr + seq_idx * block_tables_stride
@@ -345,13 +492,20 @@ def mla_decode_min_kernel(
     L = gl.full([BLOCK_M], 1.0, gl.float32, gl.SliceLayout(1, QK_WMMA))
     acc = gl.zeros([BLOCK_M, KV_LORA_RANK], dtype=gl.float32, layout=PVL)
 
-    # Each tile issues two TDM loads, so with DEPTH tiles in flight there are
-    # 2*STAGES outstanding transfers at the top of a steady-state iteration;
-    # async_wait(2*STAGES-1) retires exactly this tile's kv_lora and
-    # async_wait(2*STAGES-2) its k_rope.
-    DEPTH: gl.constexpr = STAGES - 1
+    # Each tile issues two TDM loads. DEPTH pages are primed, then one more
+    # is filled at the top of each steady-state iteration, so 2*STAGES
+    # transfers are outstanding; async_wait(2*STAGES-1) retires this tile's
+    # kv_lora and async_wait(2*STAGES-2) its k_rope.
+    #
+    # RING is the physical slot count. For the LDS-prefetch schedules the
+    # iteration still LDS-reads the current page (and peeks at the next) after
+    # TDM has already been issued into fill = slot+DEPTH. With RING == DEPTH+1
+    # that fill is the page this iteration just finished reading last trip --
+    # outstanding ds_loads would be overwritten. One extra slot puts a dead
+    # buffer between the write head and the last read, so those loads can
+    # overlap the next TDM. TDM lookahead (DEPTH) is unchanged.
 
-    # ---- prologue: prime DEPTH of the STAGES slots -------------------------
+    # ---- prologue: prime DEPTH of the RING slots -------------------------
     for prime in gl.static_range(DEPTH):
         pg = gl.load(table + gl.minimum(prime, num_tiles - 1))
         _load_page(kv_lora_desc, kv_lora_smem, pg, prime)
@@ -359,47 +513,94 @@ def mla_decode_min_kernel(
 
     # ---- steady state: load DEPTH tiles ahead, consume the oldest slot -----
     slot: gl.int32 = 0
-    if PGPF:
-        # The page index gates the TDM issue, so fetching it in the same
-        # iteration exposes its full latency. Fetch it one iteration ahead and
-        # carry it in a register, so the load overlaps the tile compute.
+    if SCHED >= 5:
+        # Software-pipelined LDS: iteration i reads tile i+1's K/RoPE operands.
+        PF_WHEN: gl.constexpr = 1 if SCHED == 5 else 2
+        k_dummy = gl.zeros([PFK, BLOCK_SIZE], dtype=q_lora.dtype, layout=K_DOT)
+        r_dummy = gl.zeros(
+            [QK_ROPE_HEAD_DIM, BLOCK_SIZE], dtype=q_lora.dtype, layout=K_DOT
+        )
+        k0, k1, k2, k3, k_rope_pf = _prefetch_k_operands(
+            kv_lora_smem, k_rope_smem, slot,
+            2 * DEPTH - 1, 2 * DEPTH - 2, NPF, PFK, PFROPE,
+            k_dummy, k_dummy, k_dummy, k_dummy, r_dummy,
+        )
         pg = gl.load(table + gl.minimum(DEPTH, num_tiles - 1))
         for tile in range(0, num_tiles - DEPTH):
-            fill_slot = (slot + DEPTH) % STAGES
+            fill_slot = (slot + DEPTH) % RING
+            if not PGPF:
+                pg = gl.load(table + gl.minimum(tile + DEPTH, num_tiles - 1))
             _load_page(kv_lora_desc, kv_lora_smem, pg, fill_slot)
             _load_page(k_rope_desc, k_rope_smem, pg, fill_slot)
-            pg = gl.load(table + gl.minimum(tile + 1 + DEPTH, num_tiles - 1))
-            L, M, acc = _process_tile(
-                q_lora, q_rope, kv_lora_smem, k_rope_smem, slot, tile,
-                qk_factor, seq_len, L, M, acc,
+            if PGPF:
+                pg = gl.load(table + gl.minimum(tile + 1 + DEPTH, num_tiles - 1))
+            L, M, acc, k0, k1, k2, k3, k_rope_pf = _process_tile_pf(
+                q_lora, q_rope, kv_lora_smem, k_rope_smem, slot,
+                (slot + 1) % RING, tile,
+                qk_factor, seq_len, L, M, acc, k0, k1, k2, k3, k_rope_pf,
                 wait_lora=2 * STAGES - 1, wait_rope=2 * STAGES - 2,
-                IS_LAST=False, SCHED=SCHED, PVL=PVL, PDOT=PDOT, VDOT=VDOT,
+                wait_next=2 * STAGES - 3, wait_next_rope=2 * STAGES - 4,
+                IS_LAST=False, PF_WHEN=PF_WHEN,
+                PFK=PFK, NPF=NPF, PFROPE=PFROPE, PVL=PVL, PDOT=PDOT, VDOT=VDOT,
             )
-            slot = (slot + 1) % STAGES
-    else:
-        for tile in range(0, num_tiles - DEPTH):
-            pg = gl.load(table + gl.minimum(tile + DEPTH, num_tiles - 1))
-            fill_slot = (slot + DEPTH) % STAGES
-            _load_page(kv_lora_desc, kv_lora_smem, pg, fill_slot)
-            _load_page(k_rope_desc, k_rope_smem, pg, fill_slot)
-            L, M, acc = _process_tile(
-                q_lora, q_rope, kv_lora_smem, k_rope_smem, slot, tile,
-                qk_factor, seq_len, L, M, acc,
-                wait_lora=2 * STAGES - 1, wait_rope=2 * STAGES - 2,
-                IS_LAST=False, SCHED=SCHED, PVL=PVL, PDOT=PDOT, VDOT=VDOT,
-            )
-            slot = (slot + 1) % STAGES
+            slot = (slot + 1) % RING
 
-    # ---- drain: DEPTH tiles with no new loads in flight --------------------
-    for k in gl.static_range(DEPTH):
-        L, M, acc = _process_tile(
-            q_lora, q_rope, kv_lora_smem, k_rope_smem, slot,
-            num_tiles - DEPTH + k,
-            qk_factor, seq_len, L, M, acc,
-            wait_lora=2 * (DEPTH - k) - 1, wait_rope=2 * (DEPTH - k) - 2,
-            IS_LAST=(k == DEPTH - 1), SCHED=SCHED, PVL=PVL, PDOT=PDOT, VDOT=VDOT,
-        )
-        slot = (slot + 1) % STAGES
+        for k in gl.static_range(DEPTH):
+            L, M, acc, k0, k1, k2, k3, k_rope_pf = _process_tile_pf(
+                q_lora, q_rope, kv_lora_smem, k_rope_smem, slot,
+                (slot + 1) % RING, num_tiles - DEPTH + k,
+                qk_factor, seq_len, L, M, acc, k0, k1, k2, k3, k_rope_pf,
+                wait_lora=2 * (DEPTH - k) - 1, wait_rope=2 * (DEPTH - k) - 2,
+                wait_next=2 * (DEPTH - k) - 3 if k < DEPTH - 1 else 0,
+                wait_next_rope=2 * (DEPTH - k) - 4 if k < DEPTH - 1 else 0,
+                IS_LAST=(k == DEPTH - 1),
+                PF_WHEN=PF_WHEN if k < DEPTH - 1 else 0,
+                PFK=PFK, NPF=NPF, PFROPE=PFROPE, PVL=PVL, PDOT=PDOT, VDOT=VDOT,
+            )
+            slot = (slot + 1) % RING
+    else:
+        if PGPF:
+            # The page index gates the TDM issue, so fetching it in the same
+            # iteration exposes its full latency. Fetch it one iteration ahead
+            # and carry it in a register, so the load overlaps the tile compute.
+            pg = gl.load(table + gl.minimum(DEPTH, num_tiles - 1))
+            for tile in range(0, num_tiles - DEPTH):
+                fill_slot = (slot + DEPTH) % STAGES
+                _load_page(kv_lora_desc, kv_lora_smem, pg, fill_slot)
+                _load_page(k_rope_desc, k_rope_smem, pg, fill_slot)
+                pg = gl.load(table + gl.minimum(tile + 1 + DEPTH, num_tiles - 1))
+                L, M, acc = _process_tile(
+                    q_lora, q_rope, kv_lora_smem, k_rope_smem, slot, tile,
+                    qk_factor, seq_len, L, M, acc,
+                    wait_lora=2 * STAGES - 1, wait_rope=2 * STAGES - 2,
+                    IS_LAST=False, SCHED=SCHED, PVL=PVL, PDOT=PDOT, VDOT=VDOT,
+                )
+                slot = (slot + 1) % STAGES
+        else:
+            for tile in range(0, num_tiles - DEPTH):
+                pg = gl.load(table + gl.minimum(tile + DEPTH, num_tiles - 1))
+                fill_slot = (slot + DEPTH) % STAGES
+                _load_page(kv_lora_desc, kv_lora_smem, pg, fill_slot)
+                _load_page(k_rope_desc, k_rope_smem, pg, fill_slot)
+                L, M, acc = _process_tile(
+                    q_lora, q_rope, kv_lora_smem, k_rope_smem, slot, tile,
+                    qk_factor, seq_len, L, M, acc,
+                    wait_lora=2 * STAGES - 1, wait_rope=2 * STAGES - 2,
+                    IS_LAST=False, SCHED=SCHED, PVL=PVL, PDOT=PDOT, VDOT=VDOT,
+                )
+                slot = (slot + 1) % STAGES
+
+        # ---- drain: DEPTH tiles with no new loads in flight ----------------
+        for k in gl.static_range(DEPTH):
+            L, M, acc = _process_tile(
+                q_lora, q_rope, kv_lora_smem, k_rope_smem, slot,
+                num_tiles - DEPTH + k,
+                qk_factor, seq_len, L, M, acc,
+                wait_lora=2 * (DEPTH - k) - 1, wait_rope=2 * (DEPTH - k) - 2,
+                IS_LAST=(k == DEPTH - 1), SCHED=SCHED, PVL=PVL, PDOT=PDOT,
+                VDOT=VDOT,
+            )
+            slot = (slot + 1) % STAGES
 
     # ---- epilogue ----------------------------------------------------------
     acc = acc * gl.convert_layout(1.0 / L[:, None], layout=PVL) * out_factor
@@ -418,7 +619,9 @@ def mla_decode_min_kernel(
 # Host wrapper
 # ---------------------------------------------------------------------------
 def mla_decode_min(q, kv_buffer, block_tables, seq_lens, q_descale, kv_descale,
-                   softmax_scale, out=None, out_dtype=torch.bfloat16, sched=0, stages=NUM_STAGES.value, pvsplit="n", pgpf=False):
+                   softmax_scale, out=None, out_dtype=torch.bfloat16, sched=0,
+                   stages=NUM_STAGES.value, pvsplit="n", pgpf=False, pfk=128,
+                   npf=3, pfrope=False):
     # Caller must ensure every sequence spans more than three KV pages
     # (seq_len > 192): the drain phase peels three tiles unconditionally.
     # Checking it here would force a device sync on every launch.
@@ -444,6 +647,9 @@ def mla_decode_min(q, kv_buffer, block_tables, seq_lens, q_descale, kv_descale,
         PDOT=_PV[pvsplit][1],
         VDOT=_PV[pvsplit][2],
         PGPF=pgpf,
+        PFK=pfk,
+        NPF=min(npf, KV_LORA_RANK.value // pfk),
+        PFROPE=pfrope,
         num_warps=NUM_WARPS,
         num_ctas=CTAS,
         num_stages=stages,
@@ -507,10 +713,16 @@ def main():
     p.add_argument("--check", action="store_true", help="compare against production")
     p.add_argument("--ref", action="store_true", help="compare against torch reference")
     p.add_argument("--compare", action="store_true", help="also time the production kernel")
-    p.add_argument("--sched", type=int, default=0, help="hot-loop schedule variant (0-4)")
+    p.add_argument("--sched", type=int, default=0, help="hot-loop schedule variant (0-6)")
     p.add_argument("--stages", type=int, default=4, help="LDS ring buffer depth")
     p.add_argument("--pvsplit", choices=["n", "m", "h"], default="n", help="PV warp tiling")
     p.add_argument("--pgpf", action="store_true", help="prefetch the block-table index one iteration ahead")
+    p.add_argument("--pfk", type=int, default=128,
+                   help="sched 5/6: width of each K chunk read one iteration ahead")
+    p.add_argument("--npf", type=int, default=3,
+                   help="sched 5/6: number of K chunks to prefetch (1-4; 4 spills)")
+    p.add_argument("--pfrope", action="store_true",
+                   help="sched 5/6: also prefetch the RoPE K operand")
     args = p.parse_args()
 
     q, kv, block_tables, seq_lens, q_descale, kv_descale = _make_inputs(
@@ -525,6 +737,7 @@ def main():
     out, kernel = mla_decode_min(
         q, kv_shuf, block_tables, seq_lens, q_descale, kv_descale, scale,
         sched=args.sched, stages=args.stages, pvsplit=args.pvsplit, pgpf=args.pgpf,
+        pfk=args.pfk, npf=args.npf, pfrope=args.pfrope,
     )
     torch.cuda.synchronize()
     print(
@@ -584,10 +797,13 @@ def main():
         lambda: mla_decode_min(
             q, kv_shuf, block_tables, seq_lens, q_descale, kv_descale, scale,
             out=out, sched=args.sched, stages=args.stages, pvsplit=args.pvsplit,
-            pgpf=args.pgpf,
+            pgpf=args.pgpf, pfk=args.pfk, npf=args.npf, pfrope=args.pfrope,
         )
     )
-    print(f"mla_min s{args.sched} st{args.stages} pv{args.pvsplit} cta{CTAS} pf{int(args.pgpf)} batch {args.batch_size}: {us:8.2f} us   {mem / (us * 1e-6):.3f} TB/s")
+    extra = ""
+    if args.sched >= 5:
+        extra = f" pfk{args.pfk} npf{args.npf} rope{int(args.pfrope)}"
+    print(f"mla_min s{args.sched}{extra} st{args.stages} pv{args.pvsplit} cta{CTAS} pf{int(args.pgpf)} batch {args.batch_size}: {us:8.2f} us   {mem / (us * 1e-6):.3f} TB/s")
 
     if args.compare:
         from aiter.ops.triton.attention.mla import mla_decode_fwd
