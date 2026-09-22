@@ -433,6 +433,97 @@ def test_mla_decode_fwd(
     )
 
 
+@torch.inference_mode()
+def test_mla_decode_fwd_specialized_short_contexts():
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("specialized decode kernel requires gfx1250")
+
+    torch.manual_seed(0)
+    seq_lens = torch.tensor(
+        [1, 64, 65, 128, 129, 191, 192, 2], dtype=torch.int32, device="cuda"
+    )
+    batch_size = seq_lens.numel()
+    block_size = 64
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    num_query_heads = 128
+    num_kv_heads = 1
+    num_blocks = 64
+
+    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
+    block_tables = torch.randint(
+        0,
+        num_blocks,
+        (batch_size, 3),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    kv_buffer = torch.randn(
+        (num_blocks, block_size, num_kv_heads, qk_head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).to(e4m3_dtype)
+    query = torch.randn(
+        (batch_size, num_query_heads, qk_head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).to(e4m3_dtype)
+    q_descale = uniform_random(
+        1, start=1e-4, end=1.0, dtype=torch.float32, device="cuda"
+    )
+    kv_descale = uniform_random(
+        1, start=1e-4, end=1.0, dtype=torch.float32, device="cuda"
+    )
+    output = torch.empty(
+        (batch_size, num_query_heads, kv_lora_rank),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    shuffled_kv = shuffle_kv_buffer(kv_buffer, kv_lora_rank)
+    sm_scale = 1.0 / (qk_head_dim**0.5)
+
+    mla_decode_fwd(
+        q=query,
+        kv_buffer=shuffled_kv,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seq_lens,
+        max_seqlen_kv=int(seq_lens.max()),
+        block_tables=block_tables,
+        softmax_scale=sm_scale,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        causal=True,
+        q_descale=q_descale,
+        kv_descale=kv_descale,
+        shuffled_kv_cache=True,
+    )
+    reference = torch_mla_extend(
+        query,
+        kv_buffer,
+        cu_seqlens_q,
+        seq_lens,
+        block_tables,
+        kv_lora_rank,
+        sm_scale,
+        q_descale=q_descale,
+        kv_descale=kv_descale,
+        o_dtype=torch.bfloat16,
+    )
+    assert (
+        checkAllclose(
+            output,
+            reference,
+            atol=1.5e-1,
+            rtol=1.5e-1,
+            tol_err_ratio=0.01,
+            msg="specialized MLA decode short contexts",
+        )
+        <= 0.01
+    )
+
+
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("ctx_lens", [200])
 @pytest.mark.parametrize("num_heads", [(16, 1), (128, 1)])
