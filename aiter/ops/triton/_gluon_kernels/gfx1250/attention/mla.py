@@ -1560,6 +1560,16 @@ def _find_seq_idx(
     return left - 1
 
 
+@gluon.jit
+def _load_page_idx(table, j):
+    return gl.load(table + j)
+
+
+@gluon.jit
+def _load_page_idx_clamped(table, j, ntiles):
+    return gl.load(table + gl.minimum(j, ntiles - 1))
+
+
 _mla_decode_fwd_kernel_repr = make_kernel_repr(
     "_mla_decode_fwd_kernel",
     [
@@ -1589,7 +1599,7 @@ def _mla_decode_fwd_kernel(
     query_ptr,  # [total_num_tokens, num_query_heads, head_size]
     query_scales_ptr,
     kv_buffer_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
-    block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
+    block_tables_ptr: tl.const,  # [num_seqs, max_num_blocks_per_seq]
     seq_lens_ptr,  # [num_seqs]
     SCALE: gl.constexpr,  # float32
     q_scale_ptr,  # float32
@@ -1944,28 +1954,24 @@ def _mla_decode_fwd_kernel(
         assert QUERY_DTYPE == "fp8" and KV_CACHE_DTYPE == "fp8"
         j_hbm_start: gl.int32 = segm_idx * tiles_per_segment
         num_tiles_this_seg: gl.int32 = pgm.tile_end - pgm.tile_start
-        j_hbm: gl.int32 = 0
+        table = block_tables_ptr_shifted + j_hbm_start
         buffer_id: gl.int32 = 0
 
-        j_hbm, physical_block_idx = pgm.load_physical_block_idx(
-            j_hbm, block_tables_ptr_shifted, j_hbm_start
-        )
+        physical_block_idx = _load_page_idx(table, 0)
         row_offsets = pgm.get_kv_buffer_row_offsets(physical_block_idx)
         pgm.tdm_load_global_to_shared_kv_lora(row_offsets, 0)
         pgm.tdm_load_global_to_shared_k_rope(row_offsets, 0)
 
         if num_tiles_this_seg > 2:
-            j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
-                j_hbm, block_tables_ptr_shifted, j_hbm_start, num_tiles_this_seg
+            next_physical_block_idx = _load_page_idx_clamped(
+                table, 1, num_tiles_this_seg
             )
             row_offsets = pgm.get_kv_buffer_row_offsets(next_physical_block_idx)
             pgm.tdm_load_global_to_shared_kv_lora(row_offsets, 1)
             pgm.tdm_load_global_to_shared_k_rope(row_offsets, 1)
 
-            j_hbm, next_next_physical_block_idx = (
-                pgm.load_physical_block_idx_with_mod(
-                    j_hbm, block_tables_ptr_shifted, j_hbm_start, num_tiles_this_seg
-                )
+            next_next_physical_block_idx = _load_page_idx_clamped(
+                table, 2, num_tiles_this_seg
             )
             row_offsets = pgm.get_kv_buffer_row_offsets(
                 next_next_physical_block_idx
@@ -1973,14 +1979,18 @@ def _mla_decode_fwd_kernel(
             pgm.tdm_load_global_to_shared_kv_lora(row_offsets, 2)
             pgm.tdm_load_global_to_shared_k_rope(row_offsets, 2)
 
-            j_hbm, future_physical_block_idx = pgm.load_physical_block_idx_with_mod(
-                j_hbm, block_tables_ptr_shifted, j_hbm_start, num_tiles_this_seg
-            )
+            # Scalar 1-ahead page-index prefetch
+            fill_idx = _load_page_idx_clamped(table, 3, num_tiles_this_seg)
             for tile_idx in range(pgm.tile_start, pgm.tile_end - 3):
                 fill_buffer_id = (buffer_id + 3) % 4
-                row_offsets = pgm.get_kv_buffer_row_offsets(future_physical_block_idx)
+                row_offsets = pgm.get_kv_buffer_row_offsets(fill_idx)
                 pgm.tdm_load_global_to_shared_kv_lora(row_offsets, fill_buffer_id)
                 pgm.tdm_load_global_to_shared_k_rope(row_offsets, fill_buffer_id)
+                fill_idx = _load_page_idx_clamped(
+                    table,
+                    tile_idx - pgm.tile_start + 4,
+                    num_tiles_this_seg,
+                )
                 L, M, acc = pgm.process_tile_fp8(
                     L,
                     M,
@@ -1991,15 +2001,6 @@ def _mla_decode_fwd_kernel(
                     wait_lora=7,
                     wait_rope=6,
                     IS_LAST=False,
-                )
-
-                j_hbm, future_physical_block_idx = (
-                    pgm.load_physical_block_idx_with_mod(
-                        j_hbm,
-                        block_tables_ptr_shifted,
-                        j_hbm_start,
-                        num_tiles_this_seg,
-                    )
                 )
                 buffer_id = (buffer_id + 1) % 4
 
@@ -2039,8 +2040,8 @@ def _mla_decode_fwd_kernel(
                 IS_LAST=True,
             )
         elif num_tiles_this_seg > 1:
-            j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
-                j_hbm, block_tables_ptr_shifted, j_hbm_start, num_tiles_this_seg
+            next_physical_block_idx = _load_page_idx_clamped(
+                table, 1, num_tiles_this_seg
             )
             row_offsets = pgm.get_kv_buffer_row_offsets(next_physical_block_idx)
             pgm.tdm_load_global_to_shared_kv_lora(row_offsets, 1)
@@ -2093,24 +2094,25 @@ def _mla_decode_fwd_kernel(
 
     j_hbm_start: gl.int32 = segm_idx * tiles_per_segment
     max_num_tiles_this_seg: gl.int32 = pgm.tile_end - pgm.tile_start
-    j_hbm: gl.int32 = 0
+    table = block_tables_ptr_shifted + j_hbm_start
     buffer_id: gl.int32 = 0
+    j_hbm: gl.int32 = 0
 
-    j_hbm, physical_block_idx = pgm.load_physical_block_idx(
-        j_hbm, block_tables_ptr_shifted, j_hbm_start
+    physical_block_idx = _load_page_idx(table, 0)
+    next_physical_block_idx = _load_page_idx_clamped(
+        table, 1, max_num_tiles_this_seg
     )
-    j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
-        j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
-    )
+    j_hbm = 2
     row_offsets = pgm.get_kv_buffer_row_offsets(physical_block_idx)
     pgm.tdm_load_global_to_shared_kv_lora(row_offsets, 0)
     pgm.tdm_load_global_to_shared_k_rope(row_offsets, 0)
 
     for _ in range(pgm.tile_start, pgm.tile_end - 1):
         physical_block_idx = next_physical_block_idx
-        j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
-            j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
+        next_physical_block_idx = _load_page_idx_clamped(
+            table, j_hbm, max_num_tiles_this_seg
         )
+        j_hbm = j_hbm + 1
 
         S = gl.zeros(
             [BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=cfg.QK_WMMA_UNPACKED_LAYOUT
