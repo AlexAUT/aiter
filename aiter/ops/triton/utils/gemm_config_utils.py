@@ -27,6 +27,25 @@ STANDARD_M_BOUNDS = (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
+def get_a16w16_cluster_config(m: int, n: int, k: int) -> tuple | None:
+    """Return the launch parameters for a measured gfx1250 shape."""
+    bucket, _ = get_gemm_config("GEMM-A16W16-CLUSTER", m, backend="gluon")
+    if bucket.get("M") != m:
+        return None
+    entry = bucket.get(f"N={n}-K={k}")
+    if entry is None:
+        return None
+    return (
+        entry["BLOCK_M"],
+        entry["BLOCK_N"],
+        entry["BLOCK_K"],
+        entry["NUM_KSPLIT"],
+        entry["M_PEERS"],
+        entry["CLUSTERS"],
+    )
+
+
+@functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
 def _get_gemm_config_cached(
     config_name: str,
     M: int,

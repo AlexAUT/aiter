@@ -48,12 +48,22 @@ def bench_gemm_fn(
     activation: str | None = None,
     persistent: bool = False,
     kernel_type: str = "bandwidth_bound",
+    tuned: bool = False,
     **kwargs,
 ):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = torch.bfloat16
 
-    if atomic:
+    if tuned:
+        from aiter.tuned_gemm import gemm_a16w16_out
+
+        def _p_gen():
+            x, w, _, _, y = generate_gemm_a16w16_inputs(M, N, K, c_dtype, layout)
+            return x, w, y
+
+        _out_vals_keys = ["A", "B", "out"]
+        kernel_fn = gemm_a16w16_out
+    elif atomic:
         # Accumulation in bf16/fp16 leads to precision loss, cast y to fp32 to prevent that
         assert backend != "gluon", "Atomic kernel is triton-only"
         assert (
@@ -170,6 +180,7 @@ def run_model_benchmark(args, backend):
             activation=args.activation,
             persistent=args.persistent,
             kernel_type=args.kernel_type,
+            tuned=args.tuned,
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -200,6 +211,7 @@ def run_shape_benchmark(args, backend):
             atomic=args.atomic,
             persistent=args.persistent,
             kernel_type=args.kernel_type,
+            tuned=args.tuned,
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -209,6 +221,8 @@ def run_benchmark(args, defaults):
     assert not (args.shape and args.model) or not (
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
+    if args.tuned and (args.atomic or args.persistent or args.activation):
+        raise ValueError("--tuned uses dispatch and requires a plain GEMM")
 
     backend = args.backend or ("gluon" if _is_gluon_available() else "triton")
     print(f"Using backend: {backend}")
@@ -238,6 +252,9 @@ def run_benchmark(args, defaults):
 def parse_args(args: list[str] | None = None):
     parser = get_parser(kernel_name="A16W16 GEMM")
     parser = add_argparse_ff(parser)
+    parser.add_argument(
+        "--tuned", action="store_true", help="Use the tuned A16W16 dispatcher."
+    )
     parser.add_argument(
         "--atomic",
         action="store_true",

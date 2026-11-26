@@ -40,6 +40,40 @@ _GLUON_SUPPORTED_ARCHS = (
 )
 
 
+def _launch_a16w16_cluster(x, w, y, cluster_config):
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16_cluster import (
+        _gemm_a16w16_cluster_kernel,
+        cluster_splitk_layouts,
+    )
+
+    m, k = x.shape
+    n = w.shape[0]
+    bm, bn, bk, splits, peers, clusters = cluster_config
+    if y is None:
+        y = torch.empty((m, n), dtype=x.dtype, device=x.device)
+    scratch = torch.empty((m * n * splits,), dtype=torch.float32, device=x.device)
+    layouts = cluster_splitk_layouts(bm, bn, bk, splits, peers)
+    _gemm_a16w16_cluster_kernel[(clusters,)](
+        x,
+        w,
+        y,
+        scratch,
+        m,
+        n,
+        k,
+        bm,
+        bn,
+        bk,
+        splits,
+        peers,
+        clusters,
+        *layouts,
+        num_ctas=splits * peers,
+        num_warps=4,
+    )
+    return y
+
+
 def _is_gluon_available():
     """Check if the gluon backend is available for the current GPU architecture."""
     try:

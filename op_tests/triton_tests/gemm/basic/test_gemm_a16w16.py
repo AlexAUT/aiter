@@ -57,6 +57,22 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=F
     return x, weight, bias_tensor, out_dtype, y
 
 
+@pytest.mark.parametrize("M,N,K", [(64, 64, 7168), (512, 128, 7168), (512, 1024, 7168)])
+def test_gemm_a16w16_cluster(M, N, K):
+    from aiter.ops.opus._arch import _device_arch_and_cu
+    from aiter.tuned_gemm import gemm_a16w16 as tuned_gemm
+    from aiter.tuned_gemm import gemm_a16w16_out
+
+    if _device_arch_and_cu(torch.device("cuda")) != ("gfx1250", 256):
+        pytest.skip("cluster configurations target 256-CU gfx1250")
+    x, w, _, _, y = generate_gemm_a16w16_inputs(M, N, K, torch.bfloat16)
+    expected = (x.float() @ w.float().T).to(torch.bfloat16)
+    torch.testing.assert_close(tuned_gemm(x, w), expected, atol=0.1, rtol=0.01)
+    y.fill_(float("nan"))
+    gemm_a16w16_out(x, w, y)
+    torch.testing.assert_close(y, expected, atol=0.1, rtol=0.01)
+
+
 # Test plain BF16 GEMMs - the most common types.
 @pytest.mark.parametrize("M, N, K", get_shapes())
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
