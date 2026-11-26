@@ -27,7 +27,8 @@ def cluster_splitk_layouts(bm, bn, bk, splits, peers):
     )
     if peers == 1:
         reduce_bases = [[1 << i] for i in range(splits.bit_length() - 1)]
-        reducer = gl.BlockedLayout([4], [32], [4], [0], reduce_bases)
+        reduce_vec = 2 if splits == 16 else 4
+        reducer = gl.BlockedLayout([reduce_vec], [32], [4], [0], reduce_bases)
     else:
         reduce_bases = [[0, 1 << i] for i in range(splits.bit_length() - 1)]
         reduce_bases += [[bit, 0] for bit in peer_bits]
@@ -162,7 +163,11 @@ def _cluster_splitk_tile(
             elem = peer[:, None] * BM * BN + lane[None, :]
             total = gl.full((PEERS, BM * BN), 0, gl.float32, REDUCER)
         for i in gl.static_range(SPLITS):
-            total += gfx1250.buffer_load(scratch + i * TILE_M * BN, elem)
+            if SPLITS == 16:
+                # Reuse one buffer descriptor for all sixteen partials.
+                total += gfx1250.buffer_load(scratch, elem + i * TILE_M * BN)
+            else:
+                total += gfx1250.buffer_load(scratch + i * TILE_M * BN, elem)
         gl.store(
             C + (row + elem // BN) * N + col + elem % BN, total.to(C.type.element_ty)
         )
@@ -200,7 +205,7 @@ def _gemm_a16w16_cluster_kernel(
     )
     b_buf = gl.allocate_shared_memory(B.type.element_ty, [3, SPLITS, BN, BK], B_SHARED)
     start = gl.program_id(0)
-    if PEERS > 1:
+    if PEERS > 1 or (SPLITS == 16 and GRID == TILES):
         _cluster_splitk_tile(
             A,
             B,

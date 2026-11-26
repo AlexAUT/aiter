@@ -526,7 +526,14 @@ def _gemm_a16w16(
             and B.device == inp_view.device
             and inp_view.is_contiguous()
             and B.is_contiguous()
-            and (out is None or (out.device == inp_view.device and out.is_contiguous()))
+            and (
+                out is None
+                or (
+                    out.device == inp_view.device
+                    and out.is_contiguous()
+                    and out.numel() == m * n
+                )
+            )
         ):
             from aiter.ops.triton.utils.gemm_config_utils import (
                 get_a16w16_cluster_config,

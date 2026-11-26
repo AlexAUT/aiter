@@ -225,7 +225,10 @@ def run_benchmark(args, defaults):
         raise ValueError("--tuned uses dispatch and requires a plain GEMM")
 
     backend = args.backend or ("gluon" if _is_gluon_available() else "triton")
-    print(f"Using backend: {backend}")
+    if args.tuned:
+        print("Using the tuned A16W16 dispatcher")
+    else:
+        print(f"Using backend: {backend}")
 
     if args.model:
         unsupported_args = []
