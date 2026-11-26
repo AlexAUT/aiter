@@ -57,7 +57,9 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=F
     return x, weight, bias_tensor, out_dtype, y
 
 
-@pytest.mark.parametrize("M,N,K", [(64, 64, 7168), (512, 128, 7168), (512, 1024, 7168)])
+@pytest.mark.parametrize(
+    "M,N,K", [(16, 128, 4096), (64, 64, 7168), (512, 128, 7168), (512, 1024, 7168)]
+)
 def test_gemm_a16w16_cluster(M, N, K):
     from aiter.ops.opus._arch import _device_arch_and_cu
     from aiter.tuned_gemm import gemm_a16w16 as tuned_gemm

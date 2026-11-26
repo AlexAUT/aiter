@@ -1,4 +1,8 @@
 {
+  "M_LEQ_16": {
+    "M": 16,
+    "N=128-K=4096": {"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 64, "NUM_KSPLIT": 16, "M_PEERS": 1, "CLUSTERS": 4}
+  },
   "M_LEQ_64": {
     "M": 64,
     "N=64-K=7168": {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 64, "NUM_KSPLIT": 16, "M_PEERS": 1, "CLUSTERS": 4},
