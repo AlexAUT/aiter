@@ -41,7 +41,7 @@ _GLUON_SUPPORTED_ARCHS = (
 
 
 def _launch_a16w16_cluster(x, w, y, cluster_config):
-    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16_cluster import (
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
         _gemm_a16w16_cluster_kernel,
         cluster_splitk_layouts,
     )
