@@ -61,7 +61,10 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=F
     "M,N,K", [(16, 128, 4096), (64, 64, 7168), (512, 128, 7168), (512, 1024, 7168)]
 )
 def test_gemm_a16w16_cluster(M, N, K):
+    from unittest.mock import patch
+
     from aiter.ops.opus._arch import _device_arch_and_cu
+    from aiter.ops.triton.gemm.basic import gemm_a16w16 as gemm_op
     from aiter.tuned_gemm import gemm_a16w16 as tuned_gemm
     from aiter.tuned_gemm import gemm_a16w16_out
 
@@ -69,9 +72,14 @@ def test_gemm_a16w16_cluster(M, N, K):
         pytest.skip("cluster configurations target 256-CU gfx1250")
     x, w, _, _, y = generate_gemm_a16w16_inputs(M, N, K, torch.bfloat16)
     expected = (x.float() @ w.float().T).to(torch.bfloat16)
-    torch.testing.assert_close(tuned_gemm(x, w), expected, atol=0.1, rtol=0.01)
     y.fill_(float("nan"))
-    gemm_a16w16_out(x, w, y)
+    with patch.object(
+        gemm_op, "_launch_a16w16_cluster", wraps=gemm_op._launch_a16w16_cluster
+    ) as launch:
+        result = tuned_gemm(x, w)
+        gemm_a16w16_out(x, w, y)
+    assert launch.call_count == 2
+    torch.testing.assert_close(result, expected, atol=0.1, rtol=0.01)
     torch.testing.assert_close(y, expected, atol=0.1, rtol=0.01)
 
 

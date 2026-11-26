@@ -48,21 +48,22 @@ def bench_gemm_fn(
     activation: str | None = None,
     persistent: bool = False,
     kernel_type: str = "bandwidth_bound",
-    tuned: bool = False,
     **kwargs,
 ):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = torch.bfloat16
 
-    if tuned:
+    if kernel_type == "tuned":
         from aiter.tuned_gemm import gemm_a16w16_out
 
         def _p_gen():
             x, w, _, _, y = generate_gemm_a16w16_inputs(M, N, K, c_dtype, layout)
             return x, w, y
 
-        _out_vals_keys = ["A", "B", "out"]
-        kernel_fn = gemm_a16w16_out
+        def kernel_fn(x, w, y):
+            gemm_a16w16_out(x, w, y)
+
+        _out_vals_keys = ["x", "w", "y"]
     elif atomic:
         # Accumulation in bf16/fp16 leads to precision loss, cast y to fp32 to prevent that
         assert backend != "gluon", "Atomic kernel is triton-only"
@@ -180,7 +181,6 @@ def run_model_benchmark(args, backend):
             activation=args.activation,
             persistent=args.persistent,
             kernel_type=args.kernel_type,
-            tuned=args.tuned,
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -211,7 +211,6 @@ def run_shape_benchmark(args, backend):
             atomic=args.atomic,
             persistent=args.persistent,
             kernel_type=args.kernel_type,
-            tuned=args.tuned,
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -221,14 +220,13 @@ def run_benchmark(args, defaults):
     assert not (args.shape and args.model) or not (
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
-    if args.tuned and (args.atomic or args.persistent or args.activation):
-        raise ValueError("--tuned uses dispatch and requires a plain GEMM")
+    tuned = args.kernel_type == "tuned"
+    if tuned and (args.atomic or args.persistent or args.activation):
+        raise ValueError("--kernel-type tuned requires a plain GEMM")
 
     backend = args.backend or ("gluon" if _is_gluon_available() else "triton")
-    if args.tuned:
-        print("Using the tuned A16W16 dispatcher")
-    else:
-        print(f"Using backend: {backend}")
+    backend_label = "tuned A16W16 dispatcher" if tuned else backend
+    print(f"Using backend: {backend_label}")
 
     if args.model:
         unsupported_args = []
@@ -256,9 +254,6 @@ def parse_args(args: list[str] | None = None):
     parser = get_parser(kernel_name="A16W16 GEMM")
     parser = add_argparse_ff(parser)
     parser.add_argument(
-        "--tuned", action="store_true", help="Use the tuned A16W16 dispatcher."
-    )
-    parser.add_argument(
         "--atomic",
         action="store_true",
         default=False,
@@ -280,9 +275,9 @@ def parse_args(args: list[str] | None = None):
     parser.add_argument(
         "--kernel-type",
         type=str,
-        choices=["bandwidth_bound", "compute_bound"],
+        choices=["bandwidth_bound", "compute_bound", "tuned"],
         default="bandwidth_bound",
-        help="Kernel variant to use (gluon only). Default: bandwidth_bound.",
+        help="Gluon kernel variant or tuned A16W16 dispatcher. Default: bandwidth_bound.",
     )
     return get_ff_args(parser, args=args)
 

@@ -48,11 +48,12 @@ def _launch_a16w16_cluster(x, w, y, cluster_config):
 
     m, k = x.shape
     n = w.shape[0]
-    bm, bn, bk, splits, peers, clusters = cluster_config
+    bm, bn, _, splits, peers = cluster_config
+    clusters = (m // (peers * bm)) * (n // bn)
     if y is None:
         y = torch.empty((m, n), dtype=x.dtype, device=x.device)
     scratch = torch.empty((m * n * splits,), dtype=torch.float32, device=x.device)
-    layouts = cluster_splitk_layouts(bm, bn, bk, splits, peers)
+    layouts = cluster_splitk_layouts(*cluster_config)
     _gemm_a16w16_cluster_kernel[(clusters,)](
         x,
         w,
@@ -61,12 +62,7 @@ def _launch_a16w16_cluster(x, w, y, cluster_config):
         m,
         n,
         k,
-        bm,
-        bn,
-        bk,
-        splits,
-        peers,
-        clusters,
+        *cluster_config,
         *layouts,
         num_ctas=splits * peers,
         num_warps=4,

@@ -512,7 +512,7 @@ def _gemm_a16w16(
         if gfx not in SUPPORTED_OPUS_ARCHES:
             gfx = get_gfx_runtime()
             cu_num = get_cu_num()
-        cluster = None
+        config = None
         if (
             gfx == "gfx1250"
             and cu_num == 256
@@ -524,6 +524,7 @@ def _gemm_a16w16(
             and inp_view.dtype == B.dtype == otype == torch.bfloat16
             and B.shape == (n, k)
             and B.device == inp_view.device
+            and inp_view.device.index == torch.cuda.current_device()
             and inp_view.is_contiguous()
             and B.is_contiguous()
             and (
@@ -540,11 +541,11 @@ def _gemm_a16w16(
             )
 
             cluster = get_a16w16_cluster_config(m, n, k)
-            if cluster is not None and (inp_view.data_ptr() % 16 or B.data_ptr() % 16):
-                cluster = None
-        if cluster is not None:
-            config = {"libtype": "triton", "solidx": 0, "cluster_splitk": cluster}
-        else:
+            if cluster is not None and not (
+                inp_view.data_ptr() % 16 or B.data_ptr() % 16
+            ):
+                config = {"libtype": "triton", "solidx": 0, "cluster_splitk": cluster}
+        if config is None:
             config = get_GEMM_A16W16_config(
                 M=m,
                 N=n,
