@@ -512,7 +512,7 @@ def _gemm_a16w16(
         if gfx not in SUPPORTED_OPUS_ARCHES:
             gfx = get_gfx_runtime()
             cu_num = get_cu_num()
-        config = None
+        cluster_config = None
         if (
             gfx == "gfx1250"
             and cu_num == 256
@@ -536,28 +536,29 @@ def _gemm_a16w16(
                 )
             )
         ):
-            from aiter.ops.triton.utils.gemm_config_utils import (
-                get_a16w16_cluster_config,
-            )
+            from aiter.ops.triton.utils import gemm_config_utils
 
-            cluster = get_a16w16_cluster_config(m, n, k)
+            cluster = gemm_config_utils.get_a16w16_cluster_config(m, n, k)
             if cluster is not None and not (
                 inp_view.data_ptr() % 16 or B.data_ptr() % 16
             ):
-                config = {"libtype": "triton", "solidx": 0, "cluster_splitk": cluster}
-        if config is None:
-            config = get_GEMM_A16W16_config(
-                M=m,
-                N=n,
-                K=k,
-                bias=use_bias,
-                dtype=str(inp_view.dtype),
-                otype=str(otype),
-                scaleAB=scale_a is not None or scale_b is not None,
-                bpreshuffle=bpreshuffle,
-                gfx=gfx,
-                cu_num=cu_num,
-            )
+                cluster_config = {
+                    "libtype": "triton",
+                    "solidx": 0,
+                    "cluster_splitk": cluster,
+                }
+        config = cluster_config or get_GEMM_A16W16_config(
+            M=m,
+            N=n,
+            K=k,
+            bias=use_bias,
+            dtype=str(inp_view.dtype),
+            otype=str(otype),
+            scaleAB=scale_a is not None or scale_b is not None,
+            bpreshuffle=bpreshuffle,
+            gfx=gfx,
+            cu_num=cu_num,
+        )
         if config["libtype"] == "opus" and not (
             _opus_reads_layout(inp_view, k) and _opus_reads_layout(B, k)
         ):
