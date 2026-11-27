@@ -1006,25 +1006,12 @@ def _cluster_wmma(
 @gluon.jit
 def _cluster_input_desc(
     ptr, rows, row_stride, k_stride, SPLIT_COUNT: gl.constexpr, K_EXTENT: gl.constexpr,
-    K_SPLIT_STRIDE: gl.constexpr, ROW: gl.constexpr, TILE: gl.constexpr, SHARED: gl.constexpr,
+    K_SPLIT_STRIDE: gl.constexpr, ROW: gl.constexpr, SHARED: gl.constexpr,
 ):
     shape = (SPLIT_COUNT, rows, K_EXTENT) if ROW else (SPLIT_COUNT, K_EXTENT, rows)
     split_stride = K_SPLIT_STRIDE * k_stride
     strides = (split_stride, row_stride, k_stride) if ROW else (split_stride, k_stride, row_stride)
-    return gl.amd.gfx1250.tdm.make_tensor_descriptor(ptr, shape, strides, TILE, SHARED)
-
-
-@gluon.jit
-def _cluster_tail_desc(
-    ptr, rows, row_stride, k_stride, K: gl.constexpr, BK: gl.constexpr, SPLITS: gl.constexpr,
-    FULL: gl.constexpr, ROW: gl.constexpr, TILE: gl.constexpr, SHARED: gl.constexpr,
-):
-    START: gl.constexpr = K - K % (SPLITS * BK) if FULL else K - K % BK
-    ACTIVE: gl.constexpr = K % (SPLITS * BK) // BK if FULL else 1
-    WIDTH: gl.constexpr = BK if FULL else K % BK
-    return _cluster_input_desc(
-        ptr + START * k_stride, rows, row_stride, k_stride, ACTIVE, WIDTH, BK, ROW, TILE, SHARED
-    )
+    return gl.amd.gfx1250.tdm.make_tensor_descriptor(ptr, shape, strides, SHARED.shape, SHARED)
 
 
 @gluon.jit(
@@ -1051,8 +1038,7 @@ def _gemm_a16w16_cluster_kernel(
     REDUCER: gl.constexpr,
     lda=None,
     ldb=None,
-    stride_cm=None,
-    stride_cn=1,
+    strides_c=None,
     A_ROW: gl.constexpr = True,
     B_ROW: gl.constexpr = True,
 ):
@@ -1060,18 +1046,20 @@ def _gemm_a16w16_cluster_kernel(
     TILES_M: gl.constexpr = gl.cdiv(M, TILE_M)
     TILES: gl.constexpr = TILES_M * gl.cdiv(N, BN)
     gl.static_assert(SPLITS > 1 and K // (SPLITS * BK) >= 3)
-    A_TILE: gl.constexpr = [SPLITS, TILE_M, BK] if A_ROW else [SPLITS, BK, TILE_M]
-    B_TILE: gl.constexpr = [SPLITS, BN, BK] if B_ROW else [SPLITS, BK, BN]
-    a_buf = gl.allocate_shared_memory(A.type.element_ty, [3] + A_TILE, A_SHARED)
-    b_buf = gl.allocate_shared_memory(B.type.element_ty, [3] + B_TILE, B_SHARED)
+    a_buf = gl.allocate_shared_memory(A.type.element_ty, [3] + A_SHARED.shape, A_SHARED)
+    b_buf = gl.allocate_shared_memory(B.type.element_ty, [3] + B_SHARED.shape, B_SHARED)
     a_ld = (K if A_ROW else M) if lda is None else lda.to(gl.int64)
     b_ld = (K if B_ROW else N) if ldb is None else ldb.to(gl.int64)
     stride_am, stride_ak = (a_ld, 1) if A_ROW else (1, a_ld)
     stride_bn, stride_bk = (b_ld, 1) if B_ROW else (1, b_ld)
     K_PART: gl.constexpr = K // (SPLITS * BK) * BK
     K_STEPS: gl.constexpr = K_PART // BK
-    WHOLE_TAIL: gl.constexpr = K % (SPLITS * BK) >= BK
-    TAIL_STEPS: gl.constexpr = (1 if WHOLE_TAIL else 0) + (1 if K % BK else 0)
+    TAIL_TILES: gl.constexpr = K % (SPLITS * BK) // BK
+    # Each tail entry gives the K offset, active splits, and K elements per split.
+    K_TAILS: gl.constexpr = (
+        (((SPLITS * K_PART, TAIL_TILES, BK),) if TAIL_TILES else ())
+        + (((K - K % BK, 1, K % BK),) if K % BK else ())
+    )
     tile_id = gl.program_id(0)
     STATIC_BOUNDS: gl.constexpr = PEERS > 1 or SPLITS == 16
     # Retain the measured loop form for unicast with fewer than 16 splits.
@@ -1086,10 +1074,10 @@ def _gemm_a16w16_cluster_kernel(
         a_rows = TILE_M if PEERS == 1 and M % TILE_M == 0 else M - row
         b_rows = BN if PEERS == 1 and N % BN == 0 else N - col
         a_desc = _cluster_input_desc(
-            a_base, a_rows, stride_am, stride_ak, SPLITS, K_PART, K_PART, A_ROW, A_TILE, A_SHARED
+            a_base, a_rows, stride_am, stride_ak, SPLITS, K_PART, K_PART, A_ROW, A_SHARED
         )
         b_desc = _cluster_input_desc(
-            b_base, b_rows, stride_bn, stride_bk, SPLITS, K_PART, K_PART, B_ROW, B_TILE, B_SHARED
+            b_base, b_rows, stride_bn, stride_bk, SPLITS, K_PART, K_PART, B_ROW, B_SHARED
         )
         if PEERS > 1:
             # Peers rendezvous before issuing the first multicast B load.
@@ -1106,18 +1094,17 @@ def _gemm_a16w16_cluster_kernel(
             acc = _cluster_wmma(a_buf, b_buf, (K_STEPS - 2 + stage) % 3, acc, WMMA, A_ROW, B_ROW)
 
         # Distribute remaining whole tiles over the splits and zero-pad the final partial tile.
-        for step in gl.static_range(TAIL_STEPS):
-            a_tail = _cluster_tail_desc(
-                a_base, a_rows, stride_am, stride_ak, K, BK, SPLITS, WHOLE_TAIL and step == 0,
-                A_ROW, A_TILE, A_SHARED,
+        for step in gl.static_range(len(K_TAILS)):
+            start, active, width = K_TAILS[step]
+            a_tail = _cluster_input_desc(
+                a_base + start * stride_ak, a_rows, stride_am, stride_ak, active, width, BK, A_ROW, A_SHARED
             )
-            b_tail = _cluster_tail_desc(
-                b_base, b_rows, stride_bn, stride_bk, K, BK, SPLITS, WHOLE_TAIL and step == 0,
-                B_ROW, B_TILE, B_SHARED,
+            b_tail = _cluster_input_desc(
+                b_base + start * stride_bk, b_rows, stride_bn, stride_bk, active, width, BK, B_ROW, B_SHARED
             )
             _issue_cluster_loads(a_tail, b_tail, a_buf, b_buf, step, 0, A_ROW, B_ROW)
-        for step in gl.static_range(TAIL_STEPS):
-            gl.amd.gfx1250.tdm.async_wait(TAIL_STEPS - 1 - step)
+        for step in gl.static_range(len(K_TAILS)):
+            gl.amd.gfx1250.tdm.async_wait(len(K_TAILS) - 1 - step)
             acc = _cluster_wmma(a_buf, b_buf, step, acc, WMMA, A_ROW, B_ROW)
 
         scratch = Scratch + tile * SPLITS * TILE_M * BN
@@ -1145,11 +1132,10 @@ def _gemm_a16w16_cluster_kernel(
                 total += gl.amd.gfx1250.buffer_load(scratch + i * TILE_M * BN, elem)
         out_row = row + elem // BN
         out_col = col + elem % BN
-        if stride_cm is None:
+        if strides_c is None:
             output = C + out_row * N + out_col
         else:
+            stride_cm, stride_cn = strides_c
             output = C + out_row.to(gl.int64) * stride_cm + out_col.to(gl.int64) * stride_cn
-        if M % TILE_M or N % BN:
-            gl.store(output, total.to(C.type.element_ty), (out_row < M) & (out_col < N))
-        else:
-            gl.store(output, total.to(C.type.element_ty))
+        mask = (out_row < M) & (out_col < N) if M % TILE_M or N % BN else None
+        gl.store(output, total.to(C.type.element_ty), mask=mask)

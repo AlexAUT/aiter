@@ -67,7 +67,6 @@ def _launch_a16w16_cluster(x, w, y, cluster_config):
         (clusters * peers * bm * bn * splits,), dtype=torch.float32, device=x.device
     )
     layouts = cluster_splitk_layouts(*cluster_config, a_row, b_row)
-    stride_cm, stride_cn = (None, 1) if y.is_contiguous() else y.stride()
     _gemm_a16w16_cluster_kernel[(clusters,)](
         x,
         w,
@@ -80,8 +79,7 @@ def _launch_a16w16_cluster(x, w, y, cluster_config):
         *layouts,
         lda=None if x.is_contiguous() else x.stride(0 if a_row else 1),
         ldb=None if w.is_contiguous() else w.stride(0 if b_row else 1),
-        stride_cm=stride_cm,
-        stride_cn=stride_cn,
+        strides_c=None if y.is_contiguous() else y.stride(),
         A_ROW=a_row,
         B_ROW=b_row,
         num_ctas=splits * peers,

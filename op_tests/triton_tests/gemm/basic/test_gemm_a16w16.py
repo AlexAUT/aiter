@@ -104,14 +104,16 @@ def test_gemm_a16w16_cluster(M, N, K, uses_cluster):
 )
 def test_gemm_a16w16_cluster_tails_and_layout(anchor, tail, layout):
     from aiter.ops.opus._arch import _device_arch_and_cu
-    from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+    from aiter.ops.triton.utils.gemm_config_utils import (
+        A16W16_CLUSTER_FIELDS,
+        get_a16w16_cluster_config,
+    )
 
     if _device_arch_and_cu(torch.device("cuda")) != ("gfx1250", 256):
         pytest.skip("cluster configurations target 256-CU gfx1250")
-    config, tuned = get_gemm_config(
-        "GEMM-A16W16-CLUSTER", *anchor, backend="gluon", require_explicit_m=True
-    )
-    assert tuned
+    geometry = get_a16w16_cluster_config(*anchor)
+    assert geometry is not None
+    config = dict(zip(A16W16_CLUSTER_FIELDS, geometry, strict=True))
     config["kernel_type"] = "cluster_splitk"
     m, n, k = (size + edge for size, edge in zip(anchor, tail, strict=True))
     x, w, _, _, _ = generate_gemm_a16w16_inputs(
