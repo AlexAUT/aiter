@@ -963,20 +963,12 @@ def cluster_splitk_layouts(bm, bn, bk, splits, peers):
 
 
 @gluon.jit
-def _cluster_barrier(DRAIN: gl.constexpr):
-    if DRAIN:
-        # All waves must complete their partial stores before the CTA signals.
-        gl.inline_asm_elementwise(
-            "s_wait_storecnt 0\ns_mov_b32 $0, 0",
-            "=s,~{memory}",
-            [],
-            gl.int32,
-            is_pure=False,
-            pack=1,
-        )
+def _cluster_barrier():
+    # Synchronize all waves and drain their stores before the CTA signals.
     gl.barrier()
     gl.amd.gfx1250.cluster.arrive()
     gl.amd.gfx1250.cluster.wait()
+    # Keep scratch loads after the cluster wait during compilation.
     gl.inline_asm_elementwise(
         "s_mov_b32 $0, 0", "=s,~{memory}", [], gl.int32, is_pure=False, pack=1
     )
@@ -1061,7 +1053,7 @@ def _gemm_a16w16_cluster_kernel(
         )
         if PEERS > 1:
             # Peers rendezvous before issuing the first multicast B load.
-            _cluster_barrier(False)
+            _cluster_barrier()
         acc = gl.zeros((SPLITS, TILE_M, BN), gl.float32, WMMA)
         _issue_cluster_loads(a_desc, b_desc, a_buf, b_buf, 0, 0)
         _issue_cluster_loads(a_desc, b_desc, a_buf, b_buf, 1, BK)
@@ -1083,7 +1075,7 @@ def _gemm_a16w16_cluster_kernel(
             + cols[None, None, :]
         )
         gl.amd.gfx1250.buffer_store(acc, scratch, offset)
-        _cluster_barrier(True)
+        _cluster_barrier()
 
         # Each workgroup owns a different slice of the final tile.
         peer = gl.arange(0, PEERS, layout=gl.SliceLayout(1, REDUCER))
