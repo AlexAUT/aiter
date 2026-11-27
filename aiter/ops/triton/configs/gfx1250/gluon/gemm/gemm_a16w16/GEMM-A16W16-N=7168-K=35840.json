@@ -1,6 +1,12 @@
 {
     "DEFAULT_FALLBACK": true,
-    "cluster_splitk": {
-        "M_LEQ_32": {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 128, "NUM_KSPLIT": 8, "M_PEERS": 1}
+    "M_LEQ_32": {
+        "kernel_type": "cluster_splitk",
+        "BLOCK_M": 32,
+        "BLOCK_N": 64,
+        "BLOCK_K": 128,
+        "NUM_KSPLIT": 8,
+        "M_PEERS": 1,
+        "fallback": {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 512, "NUM_BUFFERS": 3, "num_warps": 4, "kernel_type": "bandwidth_bound", "waves_per_eu": 1, "REGISTER_STORE": 0}
     }
 }

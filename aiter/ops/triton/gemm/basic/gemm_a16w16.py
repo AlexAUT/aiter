@@ -20,12 +20,10 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_persistent import (
     gemm_a16w16_persistent_kernel_ as _triton_persistent_kernel,
 )
-from aiter.ops.triton.utils import gemm_config_utils
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.gemm_config_utils import (
-    A16W16_CLUSTER_FIELDS,
     clamp_num_buffers,
     compute_splitk_params,
     get_gemm_config,
@@ -40,17 +38,44 @@ _GLUON_SUPPORTED_ARCHS = (
     "gfx1250",
     "gfx1250-strict",
 )
+_CLUSTER_FIELDS = ("BLOCK_M", "BLOCK_N", "BLOCK_K", "NUM_KSPLIT", "M_PEERS")
 
 
-def _launch_a16w16_cluster(x, w, y, cluster_config):
+def _matches_cluster_tuning(x, w, y, bias, dtype, config, geometry):
+    m, k = x.shape
+    n = w.shape[0]
+    bm, bn, bk, splits, peers = geometry
+    out_dtype = y.dtype if y is not None else dtype
+    return (
+        m > 0
+        and ("M_VALUES" not in config or m in config["M_VALUES"])
+        and m % (bm * peers) == n % bn == k % (bk * splits) == 0
+        and x.dtype == w.dtype == out_dtype == torch.bfloat16
+        and get_arch() == "gfx1250"
+        and x.is_cuda
+        and x.device == w.device
+        and x.device.index == torch.cuda.current_device()
+        and x.is_contiguous()
+        and w.is_contiguous()
+        and (
+            y is None
+            or (y.device == x.device and y.shape == (m, n) and y.is_contiguous())
+        )
+        and (bias is None or (bias.device == x.device and bias.shape == (n,)))
+        and torch.cuda.get_device_properties(x.device).multi_processor_count == 256
+        and x.data_ptr() % 16 == w.data_ptr() % 16 == 0
+    )
+
+
+def _launch_a16w16_cluster(x, w, y, geometry, *, bias=None, activation=None):
     from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
-        _gemm_a16w16_cluster_kernel,
+        _KERNEL_MAP,
         cluster_splitk_layouts,
     )
 
     m, k = x.shape
     n = w.shape[0]
-    bm, bn, _, splits, peers = cluster_config
+    bm, bn, _, splits, peers = geometry
     if x.device != w.device or (y is not None and y.device != x.device):
         raise ValueError("Cluster split-K requires all tensors on the same device")
     if x.data_ptr() % 16 or w.data_ptr() % 16:
@@ -61,14 +86,18 @@ def _launch_a16w16_cluster(x, w, y, cluster_config):
         raise ValueError("Cluster split-K requires a contiguous axis in each input")
     if y is not None and y.shape != (m, n):
         raise ValueError("Cluster split-K requires an output with shape (M, N)")
+    if bias is not None and (bias.device != x.device or bias.shape != (n,)):
+        raise ValueError(
+            "Cluster split-K requires bias with shape (N,) on the input device"
+        )
     clusters = triton.cdiv(m, peers * bm) * triton.cdiv(n, bn)
     if y is None:
         y = torch.empty((m, n), dtype=x.dtype, device=x.device)
     scratch = torch.empty(
         (clusters * peers * bm * bn * splits,), dtype=torch.float32, device=x.device
     )
-    layouts = cluster_splitk_layouts(*cluster_config, a_row, b_row)
-    _gemm_a16w16_cluster_kernel[(clusters,)](
+    layouts = cluster_splitk_layouts(*geometry, a_row, b_row)
+    _KERNEL_MAP["cluster_splitk"][(clusters,)](
         x,
         w,
         y,
@@ -76,13 +105,18 @@ def _launch_a16w16_cluster(x, w, y, cluster_config):
         m,
         n,
         k,
-        *cluster_config,
+        *geometry,
         *layouts,
         lda=None if x.is_contiguous() else x.stride(0 if a_row else 1),
         ldb=None if w.is_contiguous() else w.stride(0 if b_row else 1),
         strides_c=None if y.is_contiguous() else y.stride(),
         A_ROW=a_row,
         B_ROW=b_row,
+        Bias=bias,
+        bias_stride=bias.stride(0) if bias is not None else 1,
+        activation=(
+            _get_activation_from_str(activation) if activation is not None else None
+        ),
         num_ctas=splits * peers,
         num_warps=4,
     )
@@ -150,12 +184,14 @@ def gemm_a16w16_(
         dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
         config (Optional[str]): Serialized kernel tuning parameters. A Gluon config
-            with kernel_type="cluster_splitk" selects the plain BF16 cluster kernel.
+            with kernel_type="cluster_splitk" selects the BF16 cluster kernel.
         activation (Optional[str]): Activation function ("gelu", "gelu_tanh", "silu",
             "silu_exp2", "relu").
         skip_reduce (Optional[bool]): [triton only] Skip reduction of split-K partial
             results. Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
-        kernel_type (str): [gluon only] Kernel variant ("bandwidth_bound", "compute_bound").
+        kernel_type (str): [gluon only] "bandwidth_bound", "compute_bound", or
+            "cluster_splitk". Requesting cluster split-K requires a matching
+            BF16 config or explicit cluster tuning parameters.
         backend (Optional[str]): "triton", "gluon", or None (auto-detect).
             Only None lets a kernel plugin run the call.
         persistent (bool): Use the persistent kernel, NUM_SMS workgroups
@@ -288,9 +324,10 @@ def _gemm_a16w16_native(
         torch.bfloat16,
     ), f"Weights (w) must be fp16 or bf16, got {w.dtype}"
 
-    if config and config.get("kernel_type") == "cluster_splitk" and (
-        backend != "gluon" or persistent
-    ):
+    if (
+        kernel_type == "cluster_splitk"
+        or (config or {}).get("kernel_type") == "cluster_splitk"
+    ) and (backend != "gluon" or persistent):
         raise ValueError("Cluster split-K requires the non-persistent Gluon backend")
 
     if persistent:
@@ -531,54 +568,47 @@ def _gemm_a16w16_native(
         assert (
             kernel_type in _KERNEL_MAP
         ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_KERNEL_MAP.keys())}"
-        _LOGGER.info(
-            "GEMM_A16W16 [gluon/gfx1250]: x=%s w=%s kernel=%s",
-            x.shape,
-            w.shape,
-            kernel_type,
-        )
-
         M, K = x.shape
         N, _ = w.shape
 
+        allow_cluster = config is not None or kernel_type in (
+            "bandwidth_bound",
+            "cluster_splitk",
+        )
         if config is None:
-            out_dtype = dtype if y is None else y.dtype
-            if (
-                kernel_type == "bandwidth_bound"
-                and bias is None
-                and activation is None
-                and not skip_reduce
-                and x.dtype == w.dtype == out_dtype == torch.bfloat16
-                and get_arch() == "gfx1250"
-                and x.is_cuda
-                and x.device == w.device
-                and x.device.index == torch.cuda.current_device()
-                and x.is_contiguous()
-                and w.is_contiguous()
-                and (y is None or (
-                    y.device == x.device and y.shape == (M, N) and y.is_contiguous()
-                ))
-            ):
-                geometry = gemm_config_utils.get_a16w16_cluster_config(M, N, K)
-                if (
-                    geometry is not None
-                    and torch.cuda.get_device_properties(x.device).multi_processor_count == 256
-                    and x.data_ptr() % 16 == w.data_ptr() % 16 == 0
-                ):
-                    return _launch_a16w16_cluster(x, w, y, geometry)
             config, _ = get_gemm_config("GEMM-A16W16", M, N, K, backend="gluon")
 
-        kernel_type_from_config = config.pop("kernel_type", None)
-        if kernel_type_from_config == "cluster_splitk":
-            if bias is not None or activation is not None or skip_reduce:
+        if config.get("kernel_type", kernel_type) == "cluster_splitk":
+            if not all(field in config for field in _CLUSTER_FIELDS):
                 raise ValueError(
-                    "Cluster split-K requires a plain GEMM with a reduced output"
+                    "Cluster split-K configuration is missing tuning fields"
                 )
-            out_dtype = y.dtype if y is not None else dtype
-            if x.dtype != torch.bfloat16 or w.dtype != x.dtype or out_dtype != x.dtype:
-                raise ValueError("Cluster split-K requires BF16 inputs and output")
-            cluster_config = tuple(config[field] for field in A16W16_CLUSTER_FIELDS)
-            return _launch_a16w16_cluster(x, w, y, cluster_config)
+            geometry = tuple(config[field] for field in _CLUSTER_FIELDS)
+            fallback = config.get("fallback")
+            if fallback is None:
+                if skip_reduce:
+                    raise ValueError("Cluster split-K requires a reduced output")
+                out_dtype = y.dtype if y is not None else dtype
+                if (
+                    x.dtype != torch.bfloat16
+                    or w.dtype != x.dtype
+                    or out_dtype != x.dtype
+                ):
+                    raise ValueError("Cluster split-K requires BF16 inputs and output")
+            if fallback is None or (
+                allow_cluster
+                and not skip_reduce
+                and _matches_cluster_tuning(x, w, y, bias, dtype, config, geometry)
+            ):
+                return _launch_a16w16_cluster(
+                    x, w, y, geometry, bias=bias, activation=activation
+                )
+            config = fallback
+
+        if kernel_type == "cluster_splitk":
+            raise ValueError("No eligible cluster split-K configuration for this call")
+
+        kernel_type_from_config = config.pop("kernel_type", None)
         if kernel_type_from_config is not None:
             kernel_type = kernel_type_from_config
         register_store = config.pop("REGISTER_STORE", 0)
@@ -666,9 +696,10 @@ def _gemm_a16w16_native(
                 )
 
         _LOGGER.info(
-            "GEMM_A16W16 [gluon, non-persistent]: x=%s w=%s",
+            "GEMM_A16W16 [gluon/gfx1250]: x=%s w=%s kernel=%s",
             x.shape,
             w.shape,
+            kernel_type,
         )
 
         _KERNEL_MAP[kernel_type][grid](

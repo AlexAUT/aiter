@@ -934,12 +934,6 @@ def _gemm_a16w16_compute_bound_kernel(
         gl.amd.gfx1250.tdm.async_wait(0)
 
 
-_KERNEL_MAP = {
-    "bandwidth_bound": _gemm_a16w16_bandwidth_bound_kernel,
-    "compute_bound": _gemm_a16w16_compute_bound_kernel,
-}
-
-
 @lru_cache(maxsize=128)
 def cluster_splitk_layouts(bm, bn, bk, splits, peers, a_row=True, b_row=True):
     split_bits = [[1 << i, 0, 0] for i in range(splits.bit_length() - 1)]
@@ -1041,6 +1035,9 @@ def _gemm_a16w16_cluster_kernel(
     strides_c=None,
     A_ROW: gl.constexpr = True,
     B_ROW: gl.constexpr = True,
+    Bias=None,
+    bias_stride=1,
+    activation: gl.constexpr = None,
 ):
     TILE_M: gl.constexpr = PEERS * BM
     TILES_M: gl.constexpr = gl.cdiv(M, TILE_M)
@@ -1132,6 +1129,14 @@ def _gemm_a16w16_cluster_kernel(
                 total += gl.amd.gfx1250.buffer_load(scratch + i * TILE_M * BN, elem)
         out_row = row + elem // BN
         out_col = col + elem % BN
+        if Bias is not None:
+            bias_ptr = Bias + out_col * bias_stride
+            if N % BN:
+                total += gl.load(bias_ptr, mask=out_col < N, other=0.0)
+            else:
+                total += gl.load(bias_ptr)
+        if activation is not None:
+            total = activation(total)
         if strides_c is None:
             output = C + out_row * N + out_col
         else:
@@ -1139,3 +1144,10 @@ def _gemm_a16w16_cluster_kernel(
             output = C + out_row.to(gl.int64) * stride_cm + out_col.to(gl.int64) * stride_cn
         mask = (out_row < M) & (out_col < N) if M % TILE_M or N % BN else None
         gl.store(output, total.to(C.type.element_ty), mask=mask)
+
+
+_KERNEL_MAP = {
+    "bandwidth_bound": _gemm_a16w16_bandwidth_bound_kernel,
+    "compute_bound": _gemm_a16w16_compute_bound_kernel,
+    "cluster_splitk": _gemm_a16w16_cluster_kernel,
+}

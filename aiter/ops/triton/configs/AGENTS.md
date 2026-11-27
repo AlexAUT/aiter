@@ -189,6 +189,10 @@ File format:
   `num_warps`, `num_stages`, `waves_per_eu`, `matrix_instr_nonkdim`,
   `cache_modifier` and `NUM_KSPLIT`. The tuning scripts tune only the keys
   in `DEFAULT.json`.
+- A Gluon A16W16 bucket with `"kernel_type": "cluster_splitk"` has
+  `BLOCK_M`, `BLOCK_N`, `BLOCK_K`, `NUM_KSPLIT`, and `M_PEERS`.
+  Its `fallback` holds the regular Gluon config for calls outside the
+  tuned coverage. Optional `M_VALUES` restricts the bucket to those M sizes.
 - The tuning scripts write a specialized file with `"DEFAULT_FALLBACK": true`
   and the tuned buckets. Its `"any"` is a copy of the largest bucket
   (`M_LEQ_8192` for the standard bounds). A file without that bucket gets a

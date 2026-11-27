@@ -53,7 +53,8 @@ The keys are the union of the bucket keys in the kernel family's `DEFAULT.json`
 Every key must have an entry in `SEARCH_SPACE`; otherwise the run stops with
 `Unknown config key 'X' in ...: add it to SEARCH_SPACE in space.py first`. A key that only a
 specialized file carries is not tunable until it is in `DEFAULT.json`; the installed baseline
-is timed with such keys stripped (the record lists them as `dropped_keys`).
+is timed with such keys stripped (the record lists them as `dropped_keys`). Entries with
+`fallback` are timed in full so the wrapper can choose the applicable configuration.
 
 ## The search space
 
@@ -88,9 +89,9 @@ cannot be forced onto the other backend; the driver refuses.
 Each candidate is launched once eagerly (this compiles it), then captured into a CUDA graph of 24
 launches that rotate over cold copies of the inputs (up to `--cold-mb`), replayed 25 times. The
 median per launch is recorded with min, max and TFLOPS. The installed config is always timed
-first as the baseline, through the wrapper's own `config=None` path; only when the installed entry
-carries keys that `DEFAULT.json` does not have are those stripped and the rest passed explicitly
-(`dropped_keys` in the record). The numbers include dispatch gaps and both split-K kernels, so
+first as the baseline, through the wrapper's own `config=None` path when it can select the
+installed entry. Entries with stripped keys or from another CU tree are passed explicitly.
+The numbers include dispatch gaps and both split-K kernels, so
 they are not comparable with the old rocprof logs.
 
 ## Results, resume, failures

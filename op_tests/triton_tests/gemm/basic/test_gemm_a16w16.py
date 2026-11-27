@@ -107,28 +107,117 @@ def test_gemm_a16w16_cluster(M, N, K, uses_cluster):
 )
 def test_gemm_a16w16_cluster_tails_and_layout(anchor, tail, layout):
     from aiter.ops.opus._arch import _device_arch_and_cu
-    from aiter.ops.triton.utils.gemm_config_utils import (
-        A16W16_CLUSTER_FIELDS,
-        get_a16w16_cluster_config,
-    )
+    from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
     if _device_arch_and_cu(torch.device("cuda")) != ("gfx1250", 256):
         pytest.skip("cluster configurations target 256-CU gfx1250")
-    geometry = get_a16w16_cluster_config(*anchor)
-    assert geometry is not None
-    config = dict(zip(A16W16_CLUSTER_FIELDS, geometry, strict=True))
-    config["kernel_type"] = "cluster_splitk"
+    config, _ = get_gemm_config("GEMM-A16W16", *anchor, backend="gluon")
+    assert config["kernel_type"] == "cluster_splitk"
+    config.pop("fallback")
     m, n, k = (size + edge for size, edge in zip(anchor, tail, strict=True))
     x, w, _, _, _ = generate_gemm_a16w16_inputs(
         m, n, k, torch.bfloat16, layout=layout, output=False
     )
-    storage = torch.full((n + 3, m + 5), float("nan"), dtype=torch.bfloat16, device="cuda")
+    storage = torch.full(
+        (n + 3, m + 5), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
     out = storage[:n, :m].T
     expected = (x.float() @ w.float().T).to(torch.bfloat16)
     result = gemm_a16w16(x, w, y=out, config=config, backend="gluon")
     assert result is out
     torch.testing.assert_close(out, expected, atol=0.1, rtol=0.01)
     assert torch.isnan(storage[n:]).all() and torch.isnan(storage[:n, m:]).all()
+
+
+@pytest.mark.parametrize(
+    "bias_dtype,activation,selection",
+    [
+        (torch.bfloat16, None, "auto"),
+        (None, "relu", "auto"),
+        (torch.bfloat16, "gelu_tanh", "kernel_type"),
+        (torch.float32, "silu", "tail"),
+        (torch.float32, "silu_exp2", "tail_kernel_type"),
+        (torch.bfloat16, "gelu", "tail"),
+        (None, "gelu_tanh", "tail"),
+    ],
+)
+def test_gemm_a16w16_cluster_epilogue(bias_dtype, activation, selection):
+    from unittest.mock import patch
+
+    from aiter.ops.opus._arch import _device_arch_and_cu
+    from aiter.ops.triton.gemm.basic import gemm_a16w16 as gemm_op
+    from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+
+    if _device_arch_and_cu(torch.device("cuda")) != ("gfx1250", 256):
+        pytest.skip("cluster configurations target 256-CU gfx1250")
+    anchor = (64, 64, 7168)
+    kwargs = {}
+    m, n, k = anchor
+    if selection.startswith("tail"):
+        config, _ = get_gemm_config("GEMM-A16W16", *anchor, backend="gluon")
+        config.pop("fallback")
+        if selection == "tail_kernel_type":
+            kwargs["kernel_type"] = config.pop("kernel_type")
+        kwargs["config"] = config
+        m, n, k = 63, 61, 7131
+    elif selection == "kernel_type":
+        kwargs["kernel_type"] = "cluster_splitk"
+    x, w, _, _, _ = generate_gemm_a16w16_inputs(m, n, k, torch.bfloat16, output=False)
+    w.mul_(k**-0.5)
+    bias = None
+    expected = x.float() @ w.float().T
+    if bias_dtype is not None:
+        bias = torch.randn((n, 2), dtype=bias_dtype, device="cuda")[:, 0]
+        expected = expected + bias.float()
+    if activation == "gelu_tanh":
+        expected = F.gelu(expected, approximate="tanh")
+    elif activation == "silu_exp2":
+        expected = F.silu(expected)
+    elif activation is not None:
+        expected = getattr(F, activation)(expected)
+    with patch.object(
+        gemm_op, "_launch_a16w16_cluster", wraps=gemm_op._launch_a16w16_cluster
+    ) as launch:
+        result = gemm_a16w16(
+            x, w, bias=bias, activation=activation, backend="gluon", **kwargs
+        )
+    launch.assert_called_once()
+    torch.testing.assert_close(
+        result, expected.to(torch.bfloat16), atol=0.02, rtol=0.01
+    )
+
+
+@pytest.mark.parametrize(
+    "M,dtype,layout",
+    [
+        (64, torch.float16, "TN"),
+        (64, torch.bfloat16, "TT"),
+        (63, torch.bfloat16, "TN"),
+    ],
+)
+def test_gemm_a16w16_cluster_fallback(M, dtype, layout):
+    from unittest.mock import patch
+
+    from aiter.ops.opus._arch import _device_arch_and_cu
+    from aiter.ops.triton.gemm.basic import gemm_a16w16 as gemm_op
+
+    if _device_arch_and_cu(torch.device("cuda")) != ("gfx1250", 256):
+        pytest.skip("cluster configurations target 256-CU gfx1250")
+    x, w, _, _, _ = generate_gemm_a16w16_inputs(M, 64, 7168, dtype, layout)
+    bias = torch.randn((64,), dtype=dtype, device="cuda")
+    expected = (x.float() @ w.float().T + bias.float()).relu().to(dtype)
+    with patch.object(gemm_op, "_launch_a16w16_cluster") as launch:
+        result = gemm_a16w16(
+            x, w, bias=bias, dtype=dtype, activation="relu", backend="gluon"
+        )
+        launch.assert_not_called()
+        with pytest.raises(
+            ValueError, match="No eligible cluster split-K configuration"
+        ):
+            gemm_a16w16(
+                x, w, dtype=dtype, kernel_type="cluster_splitk", backend="gluon"
+            )
+    torch.testing.assert_close(result, expected, atol=0.1, rtol=0.01)
 
 
 # Test plain BF16 GEMMs - the most common types.

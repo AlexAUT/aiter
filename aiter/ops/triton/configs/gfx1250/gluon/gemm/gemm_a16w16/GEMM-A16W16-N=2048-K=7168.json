@@ -32,12 +32,13 @@
         "kernel_type": "compute_bound"
     },
     "M_LEQ_64": {
-        "BLOCK_M": 32,
-        "BLOCK_N": 32,
-        "BLOCK_K": 256,
-        "NUM_BUFFERS": 6,
-        "num_warps": 4,
-        "kernel_type": "compute_bound"
+        "kernel_type": "cluster_splitk",
+        "BLOCK_M": 64,
+        "BLOCK_N": 64,
+        "BLOCK_K": 128,
+        "NUM_KSPLIT": 8,
+        "M_PEERS": 1,
+        "fallback": {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 256, "NUM_BUFFERS": 6, "num_warps": 4, "kernel_type": "compute_bound"}
     },
     "M_LEQ_128": {
         "BLOCK_M": 64,
@@ -80,15 +81,12 @@
         "kernel_type": "compute_bound"
     },
     "M_LEQ_256": {
+        "kernel_type": "cluster_splitk",
         "BLOCK_M": 64,
         "BLOCK_N": 64,
         "BLOCK_K": 128,
-        "NUM_BUFFERS": 7,
-        "num_warps": 4,
-        "kernel_type": "compute_bound"
-    },
-    "cluster_splitk": {
-        "M_LEQ_64": {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128, "NUM_KSPLIT": 8, "M_PEERS": 1},
-        "M_LEQ_256": {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128, "NUM_KSPLIT": 4, "M_PEERS": 4}
+        "NUM_KSPLIT": 4,
+        "M_PEERS": 4,
+        "fallback": {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128, "NUM_BUFFERS": 7, "num_warps": 4, "kernel_type": "compute_bound"}
     }
 }

@@ -153,12 +153,16 @@ def resolve_installed(spec, shape, backend, cu_num=_DEVICE_CU):
 
 def installed_baseline(spec, shape, backend, keys, cu_num=None):
     """The installed config of the tree a sweep installs into (cu_num as in resolve_installed)
-    -> (config with only the family's keys, is_tuned, dropped keys, explicit). explicit: the
+    -> (config to time, is_tuned, dropped keys, explicit). explicit: the
     launch must pass this config, because the wrapper's config=None path reads another tree on
     this device, or keys had to be dropped."""
     installed, is_tuned = resolve_installed(spec, shape, backend, cu_num=cu_num)
-    config = {k: v for k, v in installed.items() if k in keys}
-    dropped = sorted(k for k in installed if k not in keys)
+    config = (
+        installed
+        if "fallback" in installed
+        else {k: v for k, v in installed.items() if k in keys}
+    )
+    dropped = sorted(installed.keys() - config.keys())
     explicit = bool(dropped) or installed != resolve_installed(spec, shape, backend)[0]
     return config, is_tuned, dropped, explicit
 

@@ -22,9 +22,10 @@ here. Update this file in the same change as any behaviour change.
    `load_config_json()`. No hardcoded key lists, no `json.load(open(...))` on config files.
 2. Keys that are not in the family's `DEFAULT.json` are not tunable: they are never swept, and the
    installed baseline is timed with those keys stripped (recorded as `dropped_keys`), so a key the
-   kernel does not take is never launched. A key without a `SEARCH_SPACE` entry stops the run with
-   `Unknown config key 'X' in <DEFAULT.json>: add it to SEARCH_SPACE in space.py first`. Never pin
-   or skip it silently.
+   kernel does not take is never launched. Time installed entries with `fallback` in full so the
+   wrapper can select either configuration. A key in `DEFAULT.json` without a `SEARCH_SPACE`
+   entry stops the run with
+   `Unknown config key 'X' in <DEFAULT.json>: add it to SEARCH_SPACE in space.py first`.
 3. The whole `SEARCH_SPACE` is swept. No CLI overrides, no caps, no sampling. `BLOCK_SIZE_M/N`
    values below `MIN_DOT_TILE` (8) are vector tiles: only a kernel with `vector_tiles=True` gets
    them, so the other kernels keep the lists they had. With several K steps, `should_skip_generic`

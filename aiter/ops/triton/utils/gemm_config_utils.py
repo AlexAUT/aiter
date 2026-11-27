@@ -21,33 +21,9 @@ from aiter.ops.triton.utils.config_utils import (
     USE_LRU_CACHE,
     load_config_json,
     resolve_config_dir,
-    select_leq_config,
 )
 
 STANDARD_M_BOUNDS = (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
-A16W16_CLUSTER_FIELDS = ("BLOCK_M", "BLOCK_N", "BLOCK_K", "NUM_KSPLIT", "M_PEERS")
-
-
-@functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
-def get_a16w16_cluster_config(m: int, n: int, k: int) -> tuple | None:
-    """Select the cluster variant from the regular Gluon GEMM tuning file.
-
-    M_VALUES restricts a variant to individually tuned M values when present.
-    """
-    if min(m, n, k) <= 0:
-        return None
-    name = "GEMM-A16W16"
-    directory = resolve_config_dir("gemm", name, backend="gluon")
-    config = load_config_json(f"{directory}/{name}-N={n}-K={k}.json", required=False)
-    variant = config.get("cluster_splitk") if config else None
-    if not variant or ("M_VALUES" in variant and m not in variant["M_VALUES"]):
-        return None
-    entry = select_leq_config(variant | {"any": {}}, m, prefix="M_LEQ_")
-    if not entry:
-        return None
-    config = tuple(entry[field] for field in A16W16_CLUSTER_FIELDS)
-    bm, bn, bk, splits, peers = config
-    return config if m % (bm * peers) == n % bn == k % (bk * splits) == 0 else None
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
