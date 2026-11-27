@@ -1,0 +1,6 @@
+{
+    "DEFAULT_FALLBACK": true,
+    "M_BOUNDS": [32, 128, 256],
+    "M_LEQ_32": {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 128, "NUM_KSPLIT": 16, "M_PEERS": 1},
+    "M_LEQ_256": {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 128, "NUM_KSPLIT": 16, "M_PEERS": 1}
+}

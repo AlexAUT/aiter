@@ -29,12 +29,17 @@ STANDARD_M_BOUNDS = (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
 def get_a16w16_cluster_config(m: int, n: int, k: int) -> tuple | None:
     """Return the launch parameters for a measured gfx1250 shape."""
-    if m == 0:
+    if min(m, n, k) <= 0:
         return None
-    bucket, _ = get_gemm_config("GEMM-A16W16-CLUSTER", m, bounds=(m,), backend="gluon")
-    entry = bucket.get(f"N={n}-K={k}")
+    entry, is_tuned = get_gemm_config(
+        "GEMM-A16W16-CLUSTER", m, n, k, backend="gluon", require_explicit_m=True
+    )
+    if not is_tuned:
+        return None
     fields = ("BLOCK_M", "BLOCK_N", "BLOCK_K", "NUM_KSPLIT", "M_PEERS")
-    return tuple(entry[field] for field in fields) if entry is not None else None
+    config = tuple(entry[field] for field in fields)
+    bm, bn, bk, splits, peers = config
+    return config if m % (bm * peers) == n % bn == k % (bk * splits) == 0 else None
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
@@ -48,6 +53,8 @@ def _get_gemm_config_cached(
     backend: str = "triton",
     B: int | None = None,
     cu_num=DEVICE_CU_NUM,
+    *,
+    require_explicit_m: bool = False,
 ) -> tuple[dict, bool]:
     """
     Internal cached implementation. Do NOT use this directly — use
@@ -105,15 +112,18 @@ def _get_gemm_config_cached(
             config_dict = specialized_config
             break
 
-    # Explicit bounds override file-defined bounds; legacy files use the standard bounds.
+    # Explicit bounds override file-defined bounds.
+    default_bounds = (M,) if require_explicit_m else STANDARD_M_BOUNDS
     search_bounds = (
-        bounds if bounds is not None else config_dict.get("M_BOUNDS", STANDARD_M_BOUNDS)
+        bounds if bounds is not None else config_dict.get("M_BOUNDS", default_bounds)
     )
     assert (
         len(search_bounds) > 0
         and all(type(x) is int and x > 0 for x in search_bounds)
         and all(x < y for x, y in itertools.pairwise(search_bounds))
     ), "M_BOUNDS must be a non-empty sequence of strictly increasing positive integers"
+    if require_explicit_m and M not in search_bounds:
+        search_bounds = ()
 
     # Search for M_LEQ_x keys
     for bound in search_bounds:
@@ -158,6 +168,8 @@ def get_gemm_config(
     backend: str = "triton",
     B: int | None = None,
     cu_num=DEVICE_CU_NUM,
+    *,
+    require_explicit_m: bool = False,
 ) -> tuple[dict, bool]:
     """
     Load a GEMM configuration using the standardized M_LEQ_x/M_GEQ_y/any format.
@@ -171,7 +183,9 @@ def get_gemm_config(
     2. If B, N and K are provided, try B-specialized config: {config_name}-B={B}-N={N}-K={K}.json
     3. If N and K are provided, try to load specialized config: {config_name}-N={N}-K={K}.json
        Or if specialized_filename is provided, use: {config_name}-{specialized_filename}.json
-    4. Search M_LEQ_x using explicit bounds, file M_BOUNDS or STANDARD_M_BOUNDS
+    4. Search M_LEQ_x using explicit bounds, file M_BOUNDS or STANDARD_M_BOUNDS.
+       With require_explicit_m, search only if M is in the bounds and use (M,)
+       as the default bounds.
     5. If no M_LEQ_x matches, search for M_GEQ_x keys in reverse order
     6. Fall back to "any" if no bounds match
 
@@ -190,13 +204,24 @@ def get_gemm_config(
             DEFAULT.json. Default: this device's (DEVICE_CU_NUM). None reads
             the default tree only. Kernels never pass it; the tuning scripts
             do, to address one tree.
+        require_explicit_m: Match only M values in the bounds. Without a bound
+            list, only the key for the requested M can match.
 
     Returns:
         Dictionary with the config params (a fresh deep-copy safe to mutate),
         bool indicating if the config is tuned.(True if tuned, False otherwise)
     """
     config, is_tuned = _get_gemm_config_cached(
-        config_name, M, N, K, bounds, specialized_filename, backend, B, cu_num
+        config_name,
+        M,
+        N,
+        K,
+        bounds,
+        specialized_filename,
+        backend,
+        B,
+        cu_num,
+        require_explicit_m=require_explicit_m,
     )
     return _copy_gemm_config(config), is_tuned
 

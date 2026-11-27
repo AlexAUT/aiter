@@ -58,9 +58,19 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=F
 
 
 @pytest.mark.parametrize(
-    "M,N,K", [(16, 128, 4096), (64, 64, 7168), (512, 128, 7168), (512, 1024, 7168)]
+    "M,N,K,uses_cluster",
+    [
+        (16, 128, 4096, True),
+        (16, 64, 7168, True),
+        (64, 64, 7168, True),
+        (80, 64, 7168, False),
+        (512, 128, 7168, True),
+        (512, 1024, 7168, True),
+        (768, 2112, 7168, True),
+        (128, 384, 5120, False),
+    ],
 )
-def test_gemm_a16w16_cluster(M, N, K):
+def test_gemm_a16w16_cluster(M, N, K, uses_cluster):
     from unittest.mock import patch
 
     from aiter.ops.opus._arch import _device_arch_and_cu
@@ -78,7 +88,7 @@ def test_gemm_a16w16_cluster(M, N, K):
     ) as launch:
         result = tuned_gemm(x, w)
         gemm_a16w16_out(x, w, y)
-    assert launch.call_count == 2
+    assert launch.call_count == (2 if uses_cluster else 0)
     torch.testing.assert_close(result, expected, atol=0.1, rtol=0.01)
     torch.testing.assert_close(y, expected, atol=0.1, rtol=0.01)
 
