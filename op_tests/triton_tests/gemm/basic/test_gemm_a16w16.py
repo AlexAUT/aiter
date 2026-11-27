@@ -61,12 +61,15 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=F
     "M,N,K,uses_cluster",
     [
         (16, 128, 4096, True),
+        (16, 32, 5120, True),
         (16, 64, 7168, True),
         (64, 64, 7168, True),
-        (80, 64, 7168, False),
+        (80, 64, 7168, True),
+        (81, 64, 7168, False),
         (512, 128, 7168, True),
         (512, 1024, 7168, True),
         (768, 2112, 7168, True),
+        (96, 384, 5120, False),
         (128, 384, 5120, False),
     ],
 )

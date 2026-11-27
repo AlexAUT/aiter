@@ -110,5 +110,9 @@
   "NUM_BUFFERS": 4,
   "num_warps": 4,
   "kernel_type": "bandwidth_bound"
- }
+ },
+    "cluster_splitk": {
+        "M_VALUES": [64, 256],
+        "M_LEQ_256": {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 64, "NUM_KSPLIT": 16, "M_PEERS": 1}
+    }
 }

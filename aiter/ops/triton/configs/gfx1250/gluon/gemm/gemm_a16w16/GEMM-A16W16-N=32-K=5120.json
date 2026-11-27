@@ -1,0 +1,6 @@
+{
+    "DEFAULT_FALLBACK": true,
+    "cluster_splitk": {
+        "M_LEQ_128": {"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 64, "NUM_KSPLIT": 16, "M_PEERS": 1}
+    }
+}

@@ -86,5 +86,9 @@
         "NUM_BUFFERS": 6,
         "num_warps": 4,
         "kernel_type": "compute_bound"
+    },
+    "cluster_splitk": {
+        "M_LEQ_256": {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128, "NUM_KSPLIT": 8, "M_PEERS": 2},
+        "M_LEQ_512": {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128, "NUM_KSPLIT": 4, "M_PEERS": 4}
     }
 }

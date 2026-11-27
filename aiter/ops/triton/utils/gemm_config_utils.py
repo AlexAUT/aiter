@@ -30,20 +30,19 @@ A16W16_CLUSTER_FIELDS = ("BLOCK_M", "BLOCK_N", "BLOCK_K", "NUM_KSPLIT", "M_PEERS
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
 def get_a16w16_cluster_config(m: int, n: int, k: int) -> tuple | None:
-    """Return the launch parameters for a measured gfx1250 shape."""
+    """Select the cluster variant from the regular Gluon GEMM tuning file.
+
+    M_VALUES restricts a variant to individually tuned M values when present.
+    """
     if min(m, n, k) <= 0:
         return None
-    name = "GEMM-A16W16-CLUSTER"
+    name = "GEMM-A16W16"
     directory = resolve_config_dir("gemm", name, backend="gluon")
-    table = load_config_json(f"{directory}/{name}-N={n}-K={k}.json", required=False)
-    if table is None:
+    config = load_config_json(f"{directory}/{name}-N={n}-K={k}.json", required=False)
+    variant = config.get("cluster_splitk") if config else None
+    if not variant or ("M_VALUES" in variant and m not in variant["M_VALUES"]):
         return None
-    if "M_BOUNDS" in table:
-        if m not in table["M_BOUNDS"]:
-            return None
-        entry = select_leq_config(table | {"any": {}}, m, prefix="M_LEQ_")
-    else:
-        entry = table.get(f"M_LEQ_{m}")
+    entry = select_leq_config(variant | {"any": {}}, m, prefix="M_LEQ_")
     if not entry:
         return None
     config = tuple(entry[field] for field in A16W16_CLUSTER_FIELDS)
