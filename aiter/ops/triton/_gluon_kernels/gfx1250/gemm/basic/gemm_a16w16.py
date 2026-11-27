@@ -968,10 +968,6 @@ def _cluster_barrier():
     gl.barrier()
     gl.amd.gfx1250.cluster.arrive()
     gl.amd.gfx1250.cluster.wait()
-    # Keep scratch loads after the cluster wait during compilation.
-    gl.inline_asm_elementwise(
-        "s_mov_b32 $0, 0", "=s,~{memory}", [], gl.int32, is_pure=False, pack=1
-    )
 
 
 @gluon.jit
