@@ -512,42 +512,7 @@ def _gemm_a16w16(
         if gfx not in SUPPORTED_OPUS_ARCHES:
             gfx = get_gfx_runtime()
             cu_num = get_cu_num()
-        cluster_config = None
-        if (
-            gfx == "gfx1250"
-            and cu_num == 256
-            and not use_bias
-            and not bpreshuffle
-            and scale_a is None
-            and scale_b is None
-            and scale_c is None
-            and inp_view.dtype == B.dtype == otype == torch.bfloat16
-            and B.shape == (n, k)
-            and B.device == inp_view.device
-            and inp_view.device.index == torch.cuda.current_device()
-            and inp_view.is_contiguous()
-            and B.is_contiguous()
-            and (
-                out is None
-                or (
-                    out.device == inp_view.device
-                    and out.is_contiguous()
-                    and out.numel() == m * n
-                )
-            )
-        ):
-            from aiter.ops.triton.utils import gemm_config_utils
-
-            cluster = gemm_config_utils.get_a16w16_cluster_config(m, n, k)
-            if cluster is not None and not (
-                inp_view.data_ptr() % 16 or B.data_ptr() % 16
-            ):
-                cluster_config = {
-                    "libtype": "triton",
-                    "solidx": 0,
-                    "cluster_splitk": cluster,
-                }
-        config = cluster_config or get_GEMM_A16W16_config(
+        config = get_GEMM_A16W16_config(
             M=m,
             N=n,
             K=k,
@@ -922,16 +887,6 @@ def triton_gemm(
         scale_a is None and scale_b is None and scale_c is None
     ), "Triton gemm_a16w16 does not support scaling yet"
     assert not bpreshuffle, "Triton gemm_a16w16 does not support bpreshuffle yet."
-    if config is not None and "cluster_splitk" in config:
-        from aiter.ops.triton.utils.gemm_config_utils import A16W16_CLUSTER_FIELDS
-
-        launch_config = dict(
-            zip(A16W16_CLUSTER_FIELDS, config["cluster_splitk"], strict=True)
-        )
-        launch_config["kernel_type"] = "cluster_splitk"
-        return gemm_a16w16(
-            inp, weights, dtype=otype, y=out, config=launch_config, backend="gluon"
-        )
     return gemm_a16w16(inp, weights, bias=bias, dtype=otype, y=out)
 
 

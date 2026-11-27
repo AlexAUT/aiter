@@ -20,6 +20,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_persistent import (
     gemm_a16w16_persistent_kernel_ as _triton_persistent_kernel,
 )
+from aiter.ops.triton.utils import gemm_config_utils
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
 from aiter.ops.triton.utils.device_info import get_num_xcds
@@ -541,6 +542,30 @@ def _gemm_a16w16_native(
         N, _ = w.shape
 
         if config is None:
+            out_dtype = dtype if y is None else y.dtype
+            if (
+                kernel_type == "bandwidth_bound"
+                and bias is None
+                and activation is None
+                and not skip_reduce
+                and x.dtype == w.dtype == out_dtype == torch.bfloat16
+                and get_arch() == "gfx1250"
+                and x.is_cuda
+                and x.device == w.device
+                and x.device.index == torch.cuda.current_device()
+                and x.is_contiguous()
+                and w.is_contiguous()
+                and (y is None or (
+                    y.device == x.device and y.shape == (M, N) and y.is_contiguous()
+                ))
+            ):
+                geometry = gemm_config_utils.get_a16w16_cluster_config(M, N, K)
+                if (
+                    geometry is not None
+                    and torch.cuda.get_device_properties(x.device).multi_processor_count == 256
+                    and x.data_ptr() % 16 == w.data_ptr() % 16 == 0
+                ):
+                    return _launch_a16w16_cluster(x, w, y, geometry)
             config, _ = get_gemm_config("GEMM-A16W16", M, N, K, backend="gluon")
 
         kernel_type_from_config = config.pop("kernel_type", None)
