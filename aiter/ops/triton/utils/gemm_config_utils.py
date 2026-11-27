@@ -24,6 +24,7 @@ from aiter.ops.triton.utils.config_utils import (
 )
 
 STANDARD_M_BOUNDS = (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+A16W16_CLUSTER_FIELDS = ("BLOCK_M", "BLOCK_N", "BLOCK_K", "NUM_KSPLIT", "M_PEERS")
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
@@ -36,8 +37,7 @@ def get_a16w16_cluster_config(m: int, n: int, k: int) -> tuple | None:
     )
     if not is_tuned:
         return None
-    fields = ("BLOCK_M", "BLOCK_N", "BLOCK_K", "NUM_KSPLIT", "M_PEERS")
-    config = tuple(entry[field] for field in fields)
+    config = tuple(entry[field] for field in A16W16_CLUSTER_FIELDS)
     bm, bn, bk, splits, peers = config
     return config if m % (bm * peers) == n % bn == k % (bk * splits) == 0 else None
 

@@ -93,6 +93,39 @@ def test_gemm_a16w16_cluster(M, N, K, uses_cluster):
     torch.testing.assert_close(y, expected, atol=0.1, rtol=0.01)
 
 
+@pytest.mark.parametrize(
+    "anchor,tail,layout",
+    [
+        ((16, 64, 7168), (-1, -3, -37), "TN"),
+        ((16, 64, 7168), (0, 0, 5), "TT"),
+        ((128, 2112, 7168), (-1, -3, 0), "NT"),
+        ((256, 3072, 7168), (-1, -3, -37), "NT"),
+    ],
+)
+def test_gemm_a16w16_cluster_tails_and_layout(anchor, tail, layout):
+    from aiter.ops.opus._arch import _device_arch_and_cu
+    from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+
+    if _device_arch_and_cu(torch.device("cuda")) != ("gfx1250", 256):
+        pytest.skip("cluster configurations target 256-CU gfx1250")
+    config, tuned = get_gemm_config(
+        "GEMM-A16W16-CLUSTER", *anchor, backend="gluon", require_explicit_m=True
+    )
+    assert tuned
+    config["kernel_type"] = "cluster_splitk"
+    m, n, k = (size + edge for size, edge in zip(anchor, tail, strict=True))
+    x, w, _, _, _ = generate_gemm_a16w16_inputs(
+        m, n, k, torch.bfloat16, layout=layout, output=False
+    )
+    storage = torch.full((n + 3, m + 5), float("nan"), dtype=torch.bfloat16, device="cuda")
+    out = storage[:n, :m].T
+    expected = (x.float() @ w.float().T).to(torch.bfloat16)
+    result = gemm_a16w16(x, w, y=out, config=config, backend="gluon")
+    assert result is out
+    torch.testing.assert_close(out, expected, atol=0.1, rtol=0.01)
+    assert torch.isnan(storage[n:]).all() and torch.isnan(storage[:n, m:]).all()
+
+
 # Test plain BF16 GEMMs - the most common types.
 @pytest.mark.parametrize("M, N, K", get_shapes())
 @pytest.mark.parametrize("backend", ["triton", "gluon"])

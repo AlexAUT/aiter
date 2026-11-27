@@ -941,16 +941,19 @@ _KERNEL_MAP = {
 
 
 @lru_cache(maxsize=128)
-def cluster_splitk_layouts(bm, bn, bk, splits, peers):
+def cluster_splitk_layouts(bm, bn, bk, splits, peers, a_row=True, b_row=True):
     split_bits = [[1 << i, 0, 0] for i in range(splits.bit_length() - 1)]
     peer_bits = [1 << i for i in range(peers.bit_length() - 1)]
     a_bases = split_bits + [[0, bit, 0] for bit in peer_bits]
     b_bases = split_bits + [[0, 0, 0] for _ in peer_bits]
+    a_shape = [splits, peers * bm, bk] if a_row else [splits, bk, peers * bm]
+    b_shape = [splits, bn, bk] if b_row else [splits, bk, bn]
+    a_shared_bases = a_bases if a_row else split_bits + [[0, 0, bit] for bit in peer_bits]
     a = gl.PaddedSharedLayout.with_identity_for(
-        [[bk, 8]], [splits, peers * bm, bk], [2, 1, 0], a_bases
+        [[bk if a_row else bm, 8]], a_shape, [2, 1, 0], a_shared_bases
     )
     b = gl.PaddedSharedLayout.with_identity_for(
-        [[bk, 8]], [splits, bn, bk], [2, 1, 0], b_bases
+        [[bk, 8]] if b_row else [[bn, 16]], b_shape, [2, 1, 0], b_bases
     )
     wmma = gl.amd.AMDWMMALayout(
         3, True, [[0, 0, 1], [0, 1, 0]], [], [16, 16, 32], cga_layout=a_bases, rank=3
@@ -971,23 +974,57 @@ def _cluster_barrier():
 
 
 @gluon.jit
-def _issue_cluster_loads(a_desc, b_desc, a_buf, b_buf, slot, k_offset):
-    a = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-        a_desc, add_offsets=[0, 0, k_offset]
-    )
-    b = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-        b_desc, add_offsets=[0, 0, k_offset]
-    )
+def _issue_cluster_loads(
+    a_desc, b_desc, a_buf, b_buf, slot, k_offset,
+    A_ROW: gl.constexpr = True, B_ROW: gl.constexpr = True,
+):
+    a_offsets = [0, 0, k_offset] if A_ROW else [0, k_offset, 0]
+    b_offsets = [0, 0, k_offset] if B_ROW else [0, k_offset, 0]
+    a = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_desc, add_offsets=a_offsets)
+    b = gl.amd.gfx1250.tdm.update_tensor_descriptor(b_desc, add_offsets=b_offsets)
     gl.amd.gfx1250.tdm.async_load_fused(
         [(a, a_buf.index(slot), 3), (b, b_buf.index(slot), 12)]
     )
 
 
 @gluon.jit
-def _cluster_wmma(a_buf, b_buf, slot, acc, WMMA: gl.constexpr):
-    a = a_buf.index(slot).load(gl.DotOperandLayout(0, WMMA, 8))
-    b = b_buf.index(slot).permute([0, 2, 1]).load(gl.DotOperandLayout(1, WMMA, 8))
-    return gl.amd.gfx1250.wmma(a, b, acc)
+def _cluster_wmma(
+    a_buf, b_buf, slot, acc, WMMA: gl.constexpr,
+    A_ROW: gl.constexpr = True, B_ROW: gl.constexpr = True,
+):
+    a = a_buf.index(slot)
+    b = b_buf.index(slot)
+    if not A_ROW:
+        a = a.permute([0, 2, 1])
+    if B_ROW:
+        b = b.permute([0, 2, 1])
+    return gl.amd.gfx1250.wmma(
+        a.load(gl.DotOperandLayout(0, WMMA, 8)), b.load(gl.DotOperandLayout(1, WMMA, 8)), acc
+    )
+
+
+@gluon.jit
+def _cluster_input_desc(
+    ptr, rows, row_stride, k_stride, SPLIT_COUNT: gl.constexpr, K_EXTENT: gl.constexpr,
+    K_SPLIT_STRIDE: gl.constexpr, ROW: gl.constexpr, TILE: gl.constexpr, SHARED: gl.constexpr,
+):
+    shape = (SPLIT_COUNT, rows, K_EXTENT) if ROW else (SPLIT_COUNT, K_EXTENT, rows)
+    split_stride = K_SPLIT_STRIDE * k_stride
+    strides = (split_stride, row_stride, k_stride) if ROW else (split_stride, k_stride, row_stride)
+    return gl.amd.gfx1250.tdm.make_tensor_descriptor(ptr, shape, strides, TILE, SHARED)
+
+
+@gluon.jit
+def _cluster_tail_desc(
+    ptr, rows, row_stride, k_stride, K: gl.constexpr, BK: gl.constexpr, SPLITS: gl.constexpr,
+    FULL: gl.constexpr, ROW: gl.constexpr, TILE: gl.constexpr, SHARED: gl.constexpr,
+):
+    START: gl.constexpr = K - K % (SPLITS * BK) if FULL else K - K % BK
+    ACTIVE: gl.constexpr = K % (SPLITS * BK) // BK if FULL else 1
+    WIDTH: gl.constexpr = BK if FULL else K % BK
+    return _cluster_input_desc(
+        ptr + START * k_stride, rows, row_stride, k_stride, ACTIVE, WIDTH, BK, ROW, TILE, SHARED
+    )
 
 
 @gluon.jit(
@@ -1012,14 +1049,29 @@ def _gemm_a16w16_cluster_kernel(
     B_SHARED: gl.constexpr,
     WMMA: gl.constexpr,
     REDUCER: gl.constexpr,
+    lda=None,
+    ldb=None,
+    stride_cm=None,
+    stride_cn=1,
+    A_ROW: gl.constexpr = True,
+    B_ROW: gl.constexpr = True,
 ):
-    TILES: gl.constexpr = M // (PEERS * BM) * (N // BN)
-    gl.static_assert(M % (PEERS * BM) == 0 and N % BN == 0 and K % (SPLITS * BK) == 0)
+    TILE_M: gl.constexpr = PEERS * BM
+    TILES_M: gl.constexpr = gl.cdiv(M, TILE_M)
+    TILES: gl.constexpr = TILES_M * gl.cdiv(N, BN)
     gl.static_assert(SPLITS > 1 and K // (SPLITS * BK) >= 3)
-    a_buf = gl.allocate_shared_memory(
-        A.type.element_ty, [3, SPLITS, PEERS * BM, BK], A_SHARED
-    )
-    b_buf = gl.allocate_shared_memory(B.type.element_ty, [3, SPLITS, BN, BK], B_SHARED)
+    A_TILE: gl.constexpr = [SPLITS, TILE_M, BK] if A_ROW else [SPLITS, BK, TILE_M]
+    B_TILE: gl.constexpr = [SPLITS, BN, BK] if B_ROW else [SPLITS, BK, BN]
+    a_buf = gl.allocate_shared_memory(A.type.element_ty, [3] + A_TILE, A_SHARED)
+    b_buf = gl.allocate_shared_memory(B.type.element_ty, [3] + B_TILE, B_SHARED)
+    a_ld = (K if A_ROW else M) if lda is None else lda.to(gl.int64)
+    b_ld = (K if B_ROW else N) if ldb is None else ldb.to(gl.int64)
+    stride_am, stride_ak = (a_ld, 1) if A_ROW else (1, a_ld)
+    stride_bn, stride_bk = (b_ld, 1) if B_ROW else (1, b_ld)
+    K_PART: gl.constexpr = K // (SPLITS * BK) * BK
+    K_STEPS: gl.constexpr = K_PART // BK
+    WHOLE_TAIL: gl.constexpr = K % (SPLITS * BK) >= BK
+    TAIL_STEPS: gl.constexpr = (1 if WHOLE_TAIL else 0) + (1 if K % BK else 0)
     tile_id = gl.program_id(0)
     STATIC_BOUNDS: gl.constexpr = PEERS > 1 or SPLITS == 16
     # Retain the measured loop form for unicast with fewer than 16 splits.
@@ -1027,39 +1079,46 @@ def _gemm_a16w16_cluster_kernel(
     end = 1 if STATIC_BOUNDS else TILES
     for index in range(begin, end, TILES):
         tile = tile_id if STATIC_BOUNDS else index
-        TILE_M: gl.constexpr = PEERS * BM
-        TILES_M: gl.constexpr = M // TILE_M
-        K_PART: gl.constexpr = K // SPLITS
-        K_STEPS: gl.constexpr = K_PART // BK
         row = tile % TILES_M * TILE_M
         col = tile // TILES_M * BN
-        a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            A + row * K,
-            shape=(SPLITS, TILE_M if PEERS == 1 else M - row, K_PART),
-            strides=(K_PART, K, 1),
-            block_shape=(SPLITS, TILE_M, BK),
-            layout=A_SHARED,
+        a_base = A + row * stride_am
+        b_base = B + col * stride_bn
+        a_rows = TILE_M if PEERS == 1 and M % TILE_M == 0 else M - row
+        b_rows = BN if PEERS == 1 and N % BN == 0 else N - col
+        a_desc = _cluster_input_desc(
+            a_base, a_rows, stride_am, stride_ak, SPLITS, K_PART, K_PART, A_ROW, A_TILE, A_SHARED
         )
-        b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            B + col * K,
-            shape=(SPLITS, BN if PEERS == 1 else N - col, K_PART),
-            strides=(K_PART, K, 1),
-            block_shape=(SPLITS, BN, BK),
-            layout=B_SHARED,
+        b_desc = _cluster_input_desc(
+            b_base, b_rows, stride_bn, stride_bk, SPLITS, K_PART, K_PART, B_ROW, B_TILE, B_SHARED
         )
         if PEERS > 1:
             # Peers rendezvous before issuing the first multicast B load.
             _cluster_barrier()
         acc = gl.zeros((SPLITS, TILE_M, BN), gl.float32, WMMA)
-        _issue_cluster_loads(a_desc, b_desc, a_buf, b_buf, 0, 0)
-        _issue_cluster_loads(a_desc, b_desc, a_buf, b_buf, 1, BK)
+        _issue_cluster_loads(a_desc, b_desc, a_buf, b_buf, 0, 0, A_ROW, B_ROW)
+        _issue_cluster_loads(a_desc, b_desc, a_buf, b_buf, 1, BK, A_ROW, B_ROW)
         for step in range(2, K_STEPS):
-            _issue_cluster_loads(a_desc, b_desc, a_buf, b_buf, step % 3, step * BK)
+            _issue_cluster_loads(a_desc, b_desc, a_buf, b_buf, step % 3, step * BK, A_ROW, B_ROW)
             gl.amd.gfx1250.tdm.async_wait(2)
-            acc = _cluster_wmma(a_buf, b_buf, (step - 2) % 3, acc, WMMA)
+            acc = _cluster_wmma(a_buf, b_buf, (step - 2) % 3, acc, WMMA, A_ROW, B_ROW)
         for stage in gl.static_range(2):
             gl.amd.gfx1250.tdm.async_wait(1 - stage)
-            acc = _cluster_wmma(a_buf, b_buf, (K_STEPS - 2 + stage) % 3, acc, WMMA)
+            acc = _cluster_wmma(a_buf, b_buf, (K_STEPS - 2 + stage) % 3, acc, WMMA, A_ROW, B_ROW)
+
+        # Distribute remaining whole tiles over the splits and zero-pad the final partial tile.
+        for step in gl.static_range(TAIL_STEPS):
+            a_tail = _cluster_tail_desc(
+                a_base, a_rows, stride_am, stride_ak, K, BK, SPLITS, WHOLE_TAIL and step == 0,
+                A_ROW, A_TILE, A_SHARED,
+            )
+            b_tail = _cluster_tail_desc(
+                b_base, b_rows, stride_bn, stride_bk, K, BK, SPLITS, WHOLE_TAIL and step == 0,
+                B_ROW, B_TILE, B_SHARED,
+            )
+            _issue_cluster_loads(a_tail, b_tail, a_buf, b_buf, step, 0, A_ROW, B_ROW)
+        for step in gl.static_range(TAIL_STEPS):
+            gl.amd.gfx1250.tdm.async_wait(TAIL_STEPS - 1 - step)
+            acc = _cluster_wmma(a_buf, b_buf, step, acc, WMMA, A_ROW, B_ROW)
 
         scratch = Scratch + tile * SPLITS * TILE_M * BN
         split = gl.arange(0, SPLITS, layout=gl.SliceLayout(1, gl.SliceLayout(2, WMMA)))
@@ -1084,6 +1143,13 @@ def _gemm_a16w16_cluster_kernel(
                 total += gl.amd.gfx1250.buffer_load(scratch, elem + i * TILE_M * BN)
             else:
                 total += gl.amd.gfx1250.buffer_load(scratch + i * TILE_M * BN, elem)
-        gl.store(
-            C + (row + elem // BN) * N + col + elem % BN, total.to(C.type.element_ty)
-        )
+        out_row = row + elem // BN
+        out_col = col + elem % BN
+        if stride_cm is None:
+            output = C + out_row * N + out_col
+        else:
+            output = C + out_row.to(gl.int64) * stride_cm + out_col.to(gl.int64) * stride_cn
+        if M % TILE_M or N % BN:
+            gl.store(output, total.to(C.type.element_ty), (out_row < M) & (out_col < N))
+        else:
+            gl.store(output, total.to(C.type.element_ty))

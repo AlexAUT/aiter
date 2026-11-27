@@ -923,9 +923,15 @@ def triton_gemm(
     ), "Triton gemm_a16w16 does not support scaling yet"
     assert not bpreshuffle, "Triton gemm_a16w16 does not support bpreshuffle yet."
     if config is not None and "cluster_splitk" in config:
-        from aiter.ops.triton.gemm.basic.gemm_a16w16 import _launch_a16w16_cluster
+        from aiter.ops.triton.utils.gemm_config_utils import A16W16_CLUSTER_FIELDS
 
-        return _launch_a16w16_cluster(inp, weights, out, config["cluster_splitk"])
+        launch_config = dict(
+            zip(A16W16_CLUSTER_FIELDS, config["cluster_splitk"], strict=True)
+        )
+        launch_config["kernel_type"] = "cluster_splitk"
+        return gemm_a16w16(
+            inp, weights, dtype=otype, y=out, config=launch_config, backend="gluon"
+        )
     return gemm_a16w16(inp, weights, bias=bias, dtype=otype, y=out)
 
 
